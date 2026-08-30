@@ -68,7 +68,7 @@ DialogueLearningAgent/
 │   ├── storage/              # SQLite 连接、迁移、仓储
 │   ├── orchestration/        # DialogueEngine（主流程编排）
 │   ├── tools/                # 工具契约/注册/路由/执行/插件发现
-│   ├── memory/               # 对话历史冷热记忆子系统（doc/07）
+│   ├── memory/               # 对话历史冷热记忆子系统（doc/07，规划中；当前仅占位）
 │   ├── evolution.py          # 词表/人格候选发现
 │   └── config/               # 配置加载、场景加载
 ├── tests/                    # 单元 + 集成测试
