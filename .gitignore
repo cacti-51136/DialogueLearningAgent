@@ -1,0 +1,30 @@
+# ---- WorkBuddy 内部数据（项目本地记忆，不进仓库）----
+.workbuddy/
+.idea/
+.vscode/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# ---- 本地配置 / 密钥 ----
+.env
+*.local
+config.local.*
+
+# ---- 模型与数据产物 ----
+*.db
+*.sqlite
+*.sqlite3
+data/embeddings/
+checkpoints/
+*.log
