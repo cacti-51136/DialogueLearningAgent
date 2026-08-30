@@ -1,0 +1,77 @@
+# L2 用户肖像层词库（doc/02 / doc/09 / §11.9）
+# 关键约束（doc/09 §约定）：
+#   - 身份/目标类（identity/goal）可预设为 preset 生效值（场景模板 l2_preset 注入）。
+#   - 情绪类（user_mood.*）与脾性类（user_temper.*）**仅作白名单候选**，初始权重 0，
+#     必须由 LLM 从真实对话言行中提炼涌现（doc/02 §11.9），模板不得 preset、用户自陈不采信。
+layer: l2
+keywords:
+  # —— 身份 / 目标类（可预设）——
+  - key: user_profile.student
+    dimension: identity
+    name: 学生
+    ktype: scalar
+    description: 用户身份为学生
+  - key: user_goal.fluency
+    dimension: goal
+    name: 提升流利度
+    ktype: scalar
+    description: 用户目标：提升口语流利度
+  - key: user_goal.exam
+    dimension: goal
+    name: 应试备考
+    ktype: scalar
+    description: 用户目标：考试备考
+  - key: user_goal.refund_or_question
+    dimension: goal
+    name: 售后咨询
+    ktype: scalar
+    description: 用户目标：退款或问题咨询
+
+  # —— 情绪类（user_mood.*，禁止预设，靠对话涌现，doc/02 §11.9）——
+  - key: user_mood.frustrated
+    dimension: mood
+    name: 受挫
+    ktype: scalar
+    description: 用户感到受挫/卡住
+  - key: user_mood.calm
+    dimension: mood
+    name: 平静
+    ktype: scalar
+    description: 用户情绪平静
+  - key: user_mood.excited
+    dimension: mood
+    name: 兴奋
+    ktype: scalar
+    description: 用户情绪兴奋/积极
+  - key: user_mood.anxious
+    dimension: mood
+    name: 焦虑
+    ktype: scalar
+    description: 用户情绪焦虑不安
+
+  # —— 脾性类（user_temper.*，禁止预设，靠对话涌现，doc/02 §11.9）——
+  - key: user_temper.impatient
+    dimension: temper
+    name: 急躁
+    ktype: scalar
+    description: 用户性子急、缺乏耐心
+  - key: user_temper.perfectionist
+    dimension: temper
+    name: 完美主义
+    ktype: scalar
+    description: 用户对细节/正确度要求高
+  - key: user_temper.humorous
+    dimension: temper
+    name: 幽默
+    ktype: scalar
+    description: 用户喜欢轻松幽默的交流
+  - key: user_temper.social_anxious
+    dimension: temper
+    name: 社恐
+    ktype: scalar
+    description: 用户在社交表达上拘谨
+  - key: user_temper.cold
+    dimension: temper
+    name: 冷淡
+    ktype: scalar
+    description: 用户态度冷淡、疏离

@@ -1,0 +1,40 @@
+# L1 功能场景层词库（doc/02 / doc/09）
+# dimension=scene 为类别型，取 argmax。关键词必须经白名单校验（doc/01 D11）。
+layer: l1
+keywords:
+  - key: scene.oral_practice
+    dimension: scene
+    name: 口语练习
+    ktype: categorical
+    description: 语言学习·口语练习
+    is_base: true
+  - key: scene.taobao_cs
+    dimension: scene
+    name: 电商客服
+    ktype: categorical
+    description: 淘宝式电商客服对话
+    is_base: true
+  - key: scene.desktop_pet
+    dimension: scene
+    name: 桌面宠物
+    ktype: categorical
+    description: 桌面宠物陪伴
+    is_base: true
+  - key: scene.virtual_gf
+    dimension: scene
+    name: 虚拟恋人
+    ktype: categorical
+    description: 虚拟恋人恋爱陪伴（含 safe_mode 硬约束）
+    is_base: true
+  - key: scene.interview
+    dimension: scene
+    name: 职场面试
+    ktype: categorical
+    description: 职场面试模拟
+    is_base: true
+  - key: scene.casual
+    dimension: scene
+    name: 通用闲聊
+    ktype: categorical
+    description: 通用闲聊陪伴
+    is_base: true

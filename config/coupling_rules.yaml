@@ -1,0 +1,78 @@
+# 层间耦合规则（doc/02 §5：L1×L2 → L3 规则推导 / doc/01 D4 确定性规则优先）
+# 规则是人格的扳机（doc/02 §11.6）：首期不开放自动采纳，需人工 review 并入。
+#
+# when:
+#   l1: [scene.xxx]        场景命中（任一即触发）
+#   l2: [user_xxx]         用户肖像命中（任一即触发）
+# then:
+#   set:  [{key: dimension, value: key}]   类别型维度设为指定值（argmax 基准）
+#   boost:[{key: l3key, weight: w}]       程度型 L3 维度加权（叠加到基线）
+rules:
+  - id: oral_practice_baseline
+    when:
+      l1: [scene.oral_practice]
+    then:
+      set:
+        - {key: role, value: role.tutor}
+      boost:
+        - {key: tone.encouraging, weight: 0.5}
+        - {key: correction_mode.immediate, weight: 0.4}
+        # 注：empathy 的强度由场景 l3_baseline(0.6) 提供，此处不再叠加，
+        # 以保留受挫时由 mood_frustrated 规则抬升的「上升空间」。
+
+  - id: mood_frustrated_boost_empathy
+    when:
+      l2: [user_mood.frustrated]
+    then:
+      boost:
+        - {key: empathy, weight: 0.3}
+        - {key: tone.gentle, weight: 0.4}
+        - {key: correction_mode.delayed, weight: 0.5}
+
+  - id: temper_impatient_boost_patience
+    when:
+      l2: [user_temper.impatient]
+    then:
+      boost:
+        - {key: patience, weight: 0.5}
+        - {key: tone.gentle, weight: 0.3}
+
+  - id: taobao_cs_baseline
+    when:
+      l1: [scene.taobao_cs]
+    then:
+      set:
+        - {key: role, value: role.assistant}
+      boost:
+        - {key: patience, weight: 0.6}
+        - {key: tone.gentle, weight: 0.4}
+
+  - id: virtual_gf_baseline
+    when:
+      l1: [scene.virtual_gf]
+    then:
+      set:
+        - {key: role, value: role.partner}
+      boost:
+        - {key: tone.playful, weight: 0.5}
+        - {key: empathy, weight: 0.5}
+
+  - id: interview_baseline
+    when:
+      l1: [scene.interview]
+    then:
+      set:
+        - {key: role, value: role.interviewer}
+      boost:
+        - {key: tone.strict, weight: 0.5}
+        - {key: verbosity, weight: 0.4}
+
+  - id: desktop_pet_baseline
+    when:
+      l1: [scene.desktop_pet]
+    then:
+      set:
+        - {key: role, value: role.pet}
+      boost:
+        - {key: tone.playful, weight: 0.6}
+        - {key: empathy, weight: 0.3}

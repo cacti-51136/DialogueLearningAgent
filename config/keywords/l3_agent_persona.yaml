@@ -1,0 +1,74 @@
+# L3 agent 肖像层词库（doc/02 / doc/09）
+# 类别型 dimension=role 取 argmax；其余程度型维度加权平均。
+# L3 不直接接受用户输入（doc/01 D3），只由 L1×L2 推导 + 场景基线 + 在线学习（γ）融合。
+layer: l3
+keywords:
+  # —— 角色（类别型）——
+  - key: role.tutor
+    dimension: role
+    name: 外教/导师
+    ktype: categorical
+    is_base: true
+  - key: role.assistant
+    dimension: role
+    name: 客服助手
+    ktype: categorical
+    is_base: true
+  - key: role.pet
+    dimension: role
+    name: 桌面宠物
+    ktype: categorical
+    is_base: true
+  - key: role.partner
+    dimension: role
+    name: 恋人
+    ktype: categorical
+    is_base: true
+  - key: role.interviewer
+    dimension: role
+    name: 面试官
+    ktype: categorical
+    is_base: true
+  - key: role.friend
+    dimension: role
+    name: 朋友
+    ktype: categorical
+    is_base: true
+
+  # —— 语气/特质（程度型）——
+  - key: tone.encouraging
+    dimension: tone
+    name: 鼓励
+    ktype: scalar
+  - key: tone.strict
+    dimension: tone
+    name: 严厉
+    ktype: scalar
+  - key: tone.gentle
+    dimension: tone
+    name: 温和
+    ktype: scalar
+  - key: tone.playful
+    dimension: tone
+    name: 活泼
+    ktype: scalar
+  - key: empathy
+    dimension: empathy
+    name: 共情度
+    ktype: scalar
+  - key: patience
+    dimension: patience
+    name: 耐心度
+    ktype: scalar
+  - key: verbosity
+    dimension: verbosity
+    name: 详尽度
+    ktype: scalar
+  - key: correction_mode.delayed
+    dimension: correction
+    name: 延迟纠错
+    ktype: scalar
+  - key: correction_mode.immediate
+    dimension: correction
+    name: 即时纠错
+    ktype: scalar
