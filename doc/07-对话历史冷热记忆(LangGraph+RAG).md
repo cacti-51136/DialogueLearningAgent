@@ -138,9 +138,9 @@ class DialogueState(TypedDict):
 - **下一轮怎么用**：`prepare_prompt` 把 `turn_summaries` 链（历轮摘要按序）渲染为"对话回顾"区块注入，每条约 ≤100 字，**完整原文默认不出现在此区块**。这把历史占用的 token 从"N 轮全文"压到"N×100 字"，与 doc/02 预算纪律天然契合。
 - **与冷记忆检索的关系**：`turn_summary` 是**确定性的、每轮必有**的轻量历史；doc/07 §4.2/§4.3 的语义检索是**额外的、按需触发**的背景补充。两者不冲突——前者保证"永远知道聊过什么主线"，后者在相关时补充细节。
 
-### 4.7 按需检索工具（local recall_memory）
+### 4.7 按需检索工具（local recall_memory，doc/08 首个内置插件）
 
-**职责**：当压缩摘要不足以支撑当前回复（如用户问"你刚才说的那个例子是什么"），由 LLM 主动发起工具调用，从本地冷热记忆取回**原文片段/指定字段**，再喂回自己。
+**职责**：当压缩摘要不足以支撑当前回复（如用户问"你刚才说的那个例子是什么"），由 LLM 主动发起工具调用，从本地冷热记忆取回**原文片段/指定字段**，再喂回自己。该工具在 doc/08 中作为**第一个内置插件**实现，遵循统一 `Tool` 契约、走两级路由，由 `ToolRegistry` 管理（与后续所有本地工具一致）。
 
 ```python
 class RecallMemoryArgs(BaseModel):
@@ -156,7 +156,7 @@ def recall_memory(args: RecallMemoryArgs) -> list[DetailBlock]:
 ```
 
 - **生命周期**：工具结果进 `detail_blocks`，**临时注入 ② `prepare_prompt`**，仅对当前这一轮生效；它**不写回 `turn_summaries`**（否则历史链会被原文污染），也**不参与 L1/L2/L3 权重计算**。
-- **与 langchain tool 的对接**：在 LangGraph 中把 `recall_memory` 注册为 LLM 的可调用工具（`bind_tools`）。节点 ③ `generate` 若检测到 tool_calls，转入节点 ⑥ `handle_tools`，取回后把 `detail_blocks` 并入上下文重生成；重生成时若再次发起调用则继续，设最大工具循环 `DLA_MEMORY__TOOL_MAX_LOOPS=2` 防死循环。
+- **与 LangGraph / doc/08 的对接**：本工具作为 `tools/plugins/recall_memory` 插件注册进 `ToolRegistry`，并 `bind_tools` 给 LLM。节点 ③ `generate` 若检测到 tool_calls，转入节点 ⑥ `handle_tools`，由 `ToolRegistry` 按 `name` 派发执行、取回后把 `detail_blocks` 并入上下文重生成；重生成时若再次发起调用则继续，设最大工具循环 `DLA_MEMORY__TOOL_MAX_LOOPS=2` 防死循环。
 - **护栏**：工具只读、不修改记忆；`scope=all_sessions` 需显式开启且受 `IMPORTANCE_DECAY` 约束；返回内容仍走 §4.5 防污染（仅作参考，不指令化）。
 
 ---
