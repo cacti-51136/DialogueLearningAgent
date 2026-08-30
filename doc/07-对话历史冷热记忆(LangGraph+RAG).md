@@ -80,7 +80,7 @@ class DialogueState(TypedDict):
         ┌─────────────────────────────────────────────────────────┐
         │  LangGraph StateGraph（记忆增强编排层，包在 doc/01 引擎外） │
         │                                                           │
-  入口 ─┤  ① retrieve_cold ──▶ ② prepare_prompt ──▶ ③ generate      │
+  入口 ─┤  ① retrieve_cold ──▶ ② prepare_prompt ──▶ ⑦ budget_guard ──▶ ③ generate      │
         │        │(条件边)              │                    │       │
         │        │                      │                    ▼       │
         │        │                      │             ④ reflect_store│
@@ -98,6 +98,7 @@ class DialogueState(TypedDict):
 - **④ `reflect_store`**：生成后——① 将本轮（user + agent 正文 + `turn_summary` + doc/06 分析事实）切块 embed 写入冷库，**`turn_summary` 作为该 turn 的索引字段**；② 滑出热窗口的老轮次迁入冷库（原文保留在 cold store，供 `recall_memory` 取回）；③ 可选：抽取跨会话事实（episode fact extraction）写入冷库高 importance 区。
 - **⑥ `handle_tools`（按需分支）**：当 ③ 的 LLM 发起 `recall_memory(query/fields)` 工具调用时触发——从热窗口（同会话近期）或冷库（更早/跨会话）取回对应的**原文片段/指定字段**，作为 `detail_block` 临时注入 ② `prepare_prompt`，并让 LLM 基于补充细节重新生成；工具结果**只进当前轮上下文、不污染长期权重、不写回默认历史链**。无工具调用时跳过此节点，直接进 ④。
 - **⑤ `maybe_compact`**：周期性把 N 条相关冷记忆压缩为一条 episode 摘要（重要事实保留、冗余丢弃），控制冷库规模。
+- **⑦ `budget_guard`（doc/11）**：在 ② 组装完成后、③ 生成之前，估算**整窗上下文** token 占比（system + 权重段 + `turn_summary` 链 + 冷记忆 + `detail_blocks` + 工具 schema + 当前消息）；达 `DLA_CTX__COMPACT_RATIO` 即运行紧凑协议（驱逐瞬态 `detail` → 合并 `turn_summary` 为 `epoch` 摘要 → 裁剪冷记忆注入 → 精简 L2/L3 表述 → 工具 schema 极简 → 必要丢弃最旧 `epoch`），重估至达标；压缩异常则跳过、不抛栈。与 ⑤ 的区别：⑤ 压缩**冷库**（长期存储），⑦ 压缩**当前上下文窗口**（单轮活跃注入）。
 
 ### 3.3 Checkpointer
 
@@ -169,6 +170,8 @@ def recall_memory(args: RecallMemoryArgs) -> list[DetailBlock]:
 | 冷 → 更冷（压缩） | 每 `DLA_MEMORY__COMPACT_EVERY_N_SESSIONS` 会话 | 相关冷记忆合并为一条 episode 摘要，降噪降本 |
 | 遗忘 / 裁剪 | 按 `recency × importance` 双层打分 | 长尾低重要记忆软删除（保留可恢复），控制规模与隐私面 |
 
+> **两类"压缩"的区别**：本表（节点 ⑤ `maybe_compact`）压缩的是**冷记忆库**（长期存储，跨会话、低频），目的是控制冷库规模与检索噪声；而 [11 · 上下文自动压缩与预算管控](./11-上下文自动压缩与预算管控.md) 的节点 ⑦ `budget_guard` 压缩的是**当前上下文窗口**（单轮活跃注入，实时、按需），目的是防止整窗占满导致截断/溢出。当 `turn_summary` 链随长会话线性增长时，正是由 ⑦ 把它合并为 `epoch` 摘要来瘦身——原文仍留冷库、可经 `recall_memory` 取回，信息不丢。
+
 ---
 
 ## 6. 与既有系统的集成点
@@ -205,6 +208,8 @@ DLA_MEMORY__TOOL_MAX_LOOPS=2               # 单轮内工具循环上限（防�
 
 > **离线策略**：`DLA_MEMORY__EMBED_BACKBONE` 留空时，使用**确定性占位 embedding**（按 id 哈希），检索结构完整可测但语义近乎随机——仅用于架构验证与单测；配置真实 backbone（如 `paraphrase-multilingual-L12-v2`，支持中英混合）后，首次需联网下载约 80MB，之后完全离线。
 
+> **上下文自动压缩相关配置（节点 ⑦ `budget_guard`）不在此列**，见 [11 · 上下文自动压缩与预算管控 §7](./11-上下文自动压缩与预算管控.md) 的 `DLA_CTX__*` 系列（`MAX_TOKENS` / `COMPACT_RATIO` / `EPOCH_MERGE_N` 等）。
+
 ---
 
 ## 8. 风险与权衡
@@ -214,7 +219,7 @@ DLA_MEMORY__TOOL_MAX_LOOPS=2               # 单轮内工具循环上限（防�
 | LangGraph 是额外依赖 | 依赖体积增加 | 纯 Python、可离线安装；checkpointer 无运行时联网要求 |
 | Embedding 离线与否 | 占位模式下冷记忆无效 | 默认占位仅为验证结构；真实语义需配置 backbone（首次下载后可离线） |
 | 检索质量依赖 embedding | 召回噪声 | 相似度阈值 + importance rerank + 预算裁剪三重过滤 |
-| 冷记忆挤爆上下文 | 成本上升 | 严格复用 doc/02 预算纪律，`PROMPT_RATIO` 硬上限 |
+| 冷记忆挤爆上下文 | 成本上升 | 严格复用 doc/02 预算纪律，`PROMPT_RATIO` 硬上限；**整窗占满**另有 [11 · 上下文自动压缩](./11-上下文自动压缩与预算管控.md) 的 `budget_guard` 主动合并 `turn_summary`、裁剪注入 |
 | 隐私（存用户对话事实） | 数据泄露 | 冷库随 `data/` 排除进 `.gitignore`，永不入仓库；软删除可恢复 |
 | 冷记忆劫持人格 | 行为偏移 | 仅作"背景参考"注入，不参与权重；不以指令形式呈现 |
 | 压缩摘要失真/超长 | 历史主线丢失或 token 浪费 | 硬上限 `SUMMARY_MAX_CHARS` + 解析层截断；调试模式打印每轮 summary 供人工复核；可 `DLA_MEMORY__INJECT_SUMMARIES_ONLY=false` 临时回退为注入原文 |
