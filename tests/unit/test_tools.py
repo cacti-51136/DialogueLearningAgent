@@ -97,3 +97,25 @@ def test_tool_call_is_logged(tmp_path):
     e.call_tool("recall_memory", {"query": "例子"}, session_id="C")
     logs = e.repo.conn.execute("SELECT tool, ok FROM tool_log WHERE session_id='C'").fetchall()
     assert any(r["tool"] == "recall_memory" for r in logs)
+
+
+def test_engine_auto_invokes_recall_memory_on_remember_question(tmp_path):
+    e = _engine(tmp_path)
+    e.start_session(sid="A")
+    e.send("我母语是粤语，平时在家都说粤语。")
+
+    captured = {}
+    orig = e.assembler.assemble
+
+    def spy(snapshot, **kw):
+        captured.update(kw)
+        return orig(snapshot, **kw)
+
+    e.assembler.assemble = spy
+
+    e.start_session(sid="B")
+    e.send("你还记得我之前提过的母语吗？")
+
+    detail = captured.get("detail_blocks") or []
+    assert detail, "工具自动触发未注入 detail_blocks"
+    assert any("粤语" in d for d in detail), f"recall_memory 未自动召回粤语相关记忆：{detail}"

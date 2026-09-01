@@ -11,6 +11,19 @@ from __future__ import annotations
 
 from ...protocol import Tool, ToolContext, ToolResult
 
+# 记忆召回触发线索（doc-08 §4 关键词命中路由）：命中任一即视为"意图回忆历史"
+_RECALL_CUES = (
+    "记得", "记得吗", "记得不", "之前", "提过", "说过", "提到过", "聊过",
+    "我们说过", "你记得", "你之前", "上次", "recall", "remember", "memory",
+)
+
+
+def _can_handle(text: str, ctx: ToolContext) -> float:
+    low = text.lower()
+    if any(cue in low for cue in _RECALL_CUES):
+        return 0.8  # 高于 tools_auto_threshold（默认 0.5），触发自动召回
+    return 0.0
+
 
 def _run(args: dict, ctx: ToolContext) -> ToolResult:
     top_k = int(args.get("top_k", 3))
@@ -62,5 +75,6 @@ TOOL = Tool(
         },
     },
     run=_run,
+    can_handle=_can_handle,
 )
 

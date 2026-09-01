@@ -155,6 +155,8 @@ class Settings:
     tools_router_top_n: int = 6
     tools_max_concurrent: int = 4
     tools_fallback_all_on_miss: bool = True
+    tools_auto_invoke: bool = True  # 只读工具达阈值时自动触发（doc/08 §9）
+    tools_auto_threshold: float = 0.5  # can_handle 自动触发阈值
 
     # ---- 回复重复/循环护栏（doc/04 §2.3）----
     repeat_freq_penalty: float = 0.3
@@ -305,6 +307,8 @@ class Settings:
             tools_router_top_n=env("DLA_TOOLS__ROUTER_TOP_N", 6, int),
             tools_max_concurrent=env("DLA_TOOLS__MAX_CONCURRENT", 4, int),
             tools_fallback_all_on_miss=env("DLA_TOOLS__FALLBACK_ALL_ON_MISS", True, _as_bool),
+            tools_auto_invoke=env("DLA_TOOLS__AUTO_INVOKE", True, _as_bool),
+            tools_auto_threshold=env("DLA_TOOLS__AUTO_THRESHOLD", 0.5, float),
             repeat_freq_penalty=env("DLA_REPEAT__FREQ_PENALTY", 0.3, float),
             repeat_presence_penalty=env("DLA_REPEAT__PRESENCE_PENALTY", 0.1, float),
             repeat_recent_n=env("DLA_REPEAT__RECENT_N", 3, int),

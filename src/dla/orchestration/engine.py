@@ -184,6 +184,42 @@ class DialogueEngine:
                     parts.append(kw.name)
         return " ".join(parts)
 
+    # ---- 工具自动触发（doc/08 §4/§9）----
+    def _run_tool_step(self, sess: _Session, user_text: str):
+        """确定性工具路由/调用：仅自动触发**只读**工具（有副作用的工具需显式调用，doc/08 §5）。
+
+        返回 (detail_blocks, tool_schema, invoked_names)。结果作为「补充细节」注入当轮 Prompt；
+        tool_schema 把可用工具暴露给真实 LLM 做 function-calling。绝不参与权重计算。
+        """
+        detail_blocks: List[str] = []
+        tool_schema_parts: List[str] = []
+        invoked: List[str] = []
+        if not self.settings.tools_enabled or self.tool_registry is None:
+            return detail_blocks, "", invoked
+        ctx = ToolContext(
+            session_id=sess.sid, repo=self.repo, settings=self.settings,
+            memory=self.memory, clock=self.clock, llm=self.llm,
+        )
+        for t in self.tool_registry.all():
+            tool_schema_parts.append(f"- {t.name}: {t.description}")
+            if not t.is_readonly:
+                continue  # 有副作用工具不自动触发
+            try:
+                score = t.can_handle(user_text, ctx)
+            except Exception:  # noqa: BLE001
+                score = 0.0
+            if score < self.settings.tools_auto_threshold:
+                continue
+            args: dict = {}
+            if "query" in (t.parameters.get("properties") or {}):
+                args["query"] = user_text
+            res = self.call_tool(t.name, args, session_id=sess.sid)
+            if res.ok and res.content:
+                detail_blocks.append(f"[{t.name}] {res.content}")
+                invoked.append(t.name)
+        tool_schema = "可用工具（如需调用请说明意图）：\n" + "\n".join(tool_schema_parts) if tool_schema_parts else ""
+        return detail_blocks, tool_schema, invoked
+
     # ---- 会话生命周期 ----
     def start_session(
         self,
@@ -308,11 +344,14 @@ class DialogueEngine:
         # 组装 + 预算护栏
         history = list(sess.history_summaries)
         cold_items = self._retrieve_cold(sess, user_text, snapshot) if self.memory is not None else []
+        detail_blocks, tool_schema, invoked_tools = self._run_tool_step(sess, user_text)
         assembled = self.assembler.assemble(
             snapshot, scene_name=sess.scene_name, greeting=sess.greeting,
             history=history, cold_memory=[it.display for it in cold_items],
+            detail_blocks=detail_blocks, tool_schema=tool_schema,
         )
         system_prompt = assembled["system_prompt"]
+        chain.append(("tools", {"invoked": invoked_tools}))
         chain.append(("assemble", assembled["debug"]))
 
         window = ContextWindow(
