@@ -10,7 +10,7 @@ import json
 import time
 from typing import List, Optional
 
-from ..core.models import WeightSnapshot
+from ..core.models import TurnSummary, WeightSnapshot
 
 
 class SQLiteRepo:
@@ -137,3 +137,21 @@ class SQLiteRepo:
     def kwmap_reset(self) -> None:
         self.conn.cursor().execute("DELETE FROM kw_agent_map")
         self.conn.commit()
+
+    # ---- 会话列表 / 历史摘要（UI 多会话切换）----
+    def list_session_ids(self) -> List[str]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT DISTINCT session_id FROM messages ORDER BY rowid DESC")
+        return [r["session_id"] for r in cur.fetchall()]
+
+    def recent_summaries(self, session_id: str, limit: int = 50) -> List[TurnSummary]:
+        """返回该会话最近的摘要（turn DESC，最新在前），供会话恢复时重建历史链。"""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT turn, text, kind, created_at FROM turn_summaries WHERE session_id=? ORDER BY turn DESC LIMIT ?",
+            (session_id, limit),
+        )
+        return [
+            TurnSummary(turn=r["turn"], text=r["text"], kind=r["kind"], timestamp=r["created_at"] or 0.0)
+            for r in cur.fetchall()
+        ]

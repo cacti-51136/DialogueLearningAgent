@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Iterator, Optional, Protocol, Sequence
 
 
 @dataclass
@@ -60,6 +60,18 @@ class LLMClient(Protocol):
         **kwargs: Any,
     ) -> LlmResult:
         """同步完成一次对话。返回 ``LlmResult``。"""
+        ...
+
+    def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        temperature: float = 0.7,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        """流式生成，逐 token 返回文本片段（不含 system 注入的 turn_summary 标记）。"""
         ...
 
 

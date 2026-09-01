@@ -10,14 +10,16 @@ dependencies = [
 
 [project.optional-dependencies]
 cli = ["typer>=0.12", "rich>=13"]
+ui = ["PyQt6>=6.4"]
 dev = ["pytest>=8", "structlog>=24"]
 llm = ["pydantic-settings>=2"]
 ml = ["sentence-transformers", "numpy"]
 graph = ["langgraph"]
-full = ["typer", "rich", "structlog", "pydantic-settings", "numpy", "sentence-transformers", "langgraph"]
+full = ["typer", "rich", "structlog", "pydantic-settings", "numpy", "sentence-transformers", "langgraph", "PyQt6>=6.4"]
 
 [project.scripts]
 dla = "apps.cli.main:main"
+dla-ui = "apps.ui.main:main"
 
 [build-system]
 requires = ["hatchling"]

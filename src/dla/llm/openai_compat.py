@@ -16,7 +16,7 @@ import json
 import time
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence
+from typing import Any, Iterator, List, Optional, Sequence
 
 from ..core.errors import LlmError, LlmRateLimitError, LlmSchemaError, LlmTimeoutError
 from ..core.ports import ChatMessage, LlmResult
@@ -45,6 +45,13 @@ def _is_json_request(response_format: Optional[dict]) -> bool:
     return "json" in str(response_format.get("type", "")).lower() or "json" in str(
         response_format.get("response_schema", "")
     ).lower()
+
+
+def _tokenize(text: str) -> List[str]:
+    """把文本切成流式 token：中文逐字、ASCII 连续成词、空白与标点单独。"""
+    import re
+
+    return re.findall(r"[一-龥]|[A-Za-z0-9]+|\s+|[^\sA-Za-z0-9一-龥]", text)
 
 
 class HTTPLLMClient:
@@ -123,6 +130,73 @@ class HTTPLLMClient:
         assert last_err is not None
         raise last_err
 
+    def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        temperature: float = 0.7,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        response_format: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        """流式生成（OpenAI SSE），逐 token 返回文本片段。"""
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "temperature": temperature,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "stream": True,
+        }
+        if self.api_key:
+            payload["stream_options"] = {"include_usage": True}
+        if response_format:
+            payload["response_format"] = response_format
+
+        last_err: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    f"{self.base_url}/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                        "Accept": "text/event-stream",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    for raw in resp:
+                        line = raw.decode("utf-8", "replace").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[len("data:"):].strip()
+                        if data_str == "[DONE]":
+                            return
+                        try:
+                            obj = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if not obj.get("choices"):
+                            continue
+                        delta = obj["choices"][0].get("delta", {})
+                        if delta.get("content"):
+                            yield delta["content"]
+                return
+            except urllib.error.HTTPError as e:
+                last_err = LlmError(f"HTTP {e.code}: {e}")
+                time.sleep(min(2 ** attempt, 8))
+            except urllib.error.URLError as e:
+                last_err = LlmTimeoutError(f"网络错误: {e}")
+                time.sleep(min(2 ** attempt, 8))
+            except Exception as e:  # noqa: BLE001
+                last_err = LlmError(f"流式读取失败: {e}")
+                break
+        if last_err is not None:
+            raise last_err
+
 
 class FakeLLMClient:
     """离线假 LLM：无 key 即可跑通闭环。
@@ -177,7 +251,7 @@ class FakeLLMClient:
         }
         return LlmResult(content=json.dumps(result, ensure_ascii=False))
 
-    def _fake_chat(self, text: str, messages: Sequence[ChatMessage]) -> LlmResult:
+    def _fake_reply_text(self, text: str, messages: Sequence[ChatMessage]) -> str:
         # 根据 system 中是否出现「鼓励」/「客服」做风格化（仅演示用）
         system_hint = ""
         for m in messages:
@@ -187,13 +261,40 @@ class FakeLLMClient:
         # 引用用户原话片段，保证不同轮次的回复文本有差异，避免离线时触发重复护栏误判
         snippet = text[:8] if text else "刚才"
         if "鼓励" in system_hint or "encourag" in system_hint.lower():
-            reply = f"别急，关于「{snippet}」我们一步步来，你已经做得很好了～"
+            return f"别急，关于「{snippet}」我们一步步来，你已经做得很好了～"
         elif "客服" in system_hint:
-            reply = f"您好，很高兴为您服务，关于「{snippet}」有什么可以帮您？"
-        else:
-            reply = f"我明白你的意思（{snippet}），我们可以继续往下聊。"
+            return f"您好，很高兴为您服务，关于「{snippet}」有什么可以帮您？"
+        return f"我明白你的意思（{snippet}），我们可以继续往下聊。"
+
+    def _fake_chat(self, text: str, messages: Sequence[ChatMessage]) -> LlmResult:
+        reply = self._fake_reply_text(text, messages)
         summary = (text[:90] + "…") if len(text) > 90 else text
         return LlmResult(content=f"{reply}\n\n<turn_summary>{summary}</turn_summary>")
+
+    def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        temperature: float = 0.7,
+        frequency_penalty: float = 0.0,
+        presence_penalty: float = 0.0,
+        response_format: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        # 分析请求不走流式，直接把完整 JSON 作为一个 token 返回
+        last_user = ""
+        for m in reversed(messages):
+            if m.role == "user":
+                last_user = m.content
+                break
+        if _is_json_request(response_format):
+            yield self._fake_analyze(last_user).content
+            return
+        reply = self._fake_reply_text(last_user, messages)
+        summary = (last_user[:90] + "…") if len(last_user) > 90 else last_user
+        full = f"{reply}\n\n<turn_summary>{summary}</turn_summary>"
+        for tok in _tokenize(full):
+            yield tok
 
 
 def make_llm_client(
