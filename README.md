@@ -18,7 +18,7 @@
 - **情绪/脾性只靠涌现**：`user_mood.*` / `user_temper.*` 类关键词**禁止预设、禁止用户自陈指定**，只能由 LLM 从对话中实时抽取（doc/02 §11.9）。
 - **开箱即跑（零强依赖）**：核心引擎只依赖 `stdlib + pyyaml`。无 API key 时自动退回内置 `FakeLLMClient`，离线即可跑通整条闭环。
 - **预设场景模板库**：内置 5 套场景（口语练习 / 淘宝客服 / 桌面宠物 / 虚拟恋人 / 职场面试），统一对齐关键词白名单；亲密类场景强制 `safe_mode` 安全硬约束，不可关闭。
-- **对话历史冷热记忆**（doc/07）：热窗口 + 冷库 RAG 检索 + SQLite checkpoint。
+- **对话历史冷热记忆**（doc/07）：热窗口（`turn_summary` 链注入）+ 冷库 RAG 检索（SQLite，零依赖确定性 embedding，可换 sentence-transformers backbone）+ 跨会话召回；仅作 Prompt「背景参考」注入，不参与权重计算。
 - **上下文自动压缩**（doc/11）：每轮估算整窗 `fill_ratio`，阶梯阈值触发紧凑协议，长会话不撑爆上下文。
 - **回复重复护栏**（doc/04 §2.3）：频率/存在惩罚 + 自重复 n-gram 检测，自动降级重生成。
 - **工具插件化**（doc/08）：统一 Tool 契约 + 原子快照注册表 + 两级路由；`recall_memory` 为首个内置插件。
@@ -70,7 +70,7 @@ DialogueLearningAgent/
 │   ├── storage/              # SQLite 连接、迁移、仓储
 │   ├── orchestration/        # DialogueEngine（主流程编排）
 │   ├── tools/                # 工具契约/注册/路由/执行/插件发现
-│   ├── memory/               # 对话历史冷热记忆子系统（doc/07，规划中；当前仅占位）
+│   ├── memory/               # 对话历史冷热记忆子系统（doc/07，零依赖已实现：embeddings/store/检索+跨会话召回）
 │   ├── evolution.py          # 词表/人格候选发现
 │   └── config/               # 配置加载、场景加载
 ├── tests/                    # 单元 + 集成测试

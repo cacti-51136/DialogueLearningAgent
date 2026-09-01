@@ -36,6 +36,8 @@ from ..core.events import (
 from ..core.models import Evidence, Layer, WeightSnapshot
 from ..core.ports import ChatMessage
 from ..evolution import CandidateRegistry, discover_from_extractions
+from ..memory import build_memory
+from ..memory.store import ColdMemoryItem
 from ..prompt.assembler import PromptAssembler
 from ..prompt.context_compact import ContextWindow, compact, fill_ratio
 from ..prompt.budget import estimate_tokens
@@ -86,6 +88,8 @@ class DialogueEngine:
             period=settings.analysis_period,
             enable_heuristics=settings.analysis_enable_heuristics,
         )
+        # 冷记忆库（doc/07）：复用引擎已有的 SQLite 连接；无 repo（内存模式）时置 None
+        self.memory = build_memory(self.repo.conn, self.settings) if self.repo is not None else None
         # 多会话：sid -> 运行时状态
         self._sessions: Dict[str, _Session] = {}
         self._active: Optional[str] = None
@@ -133,6 +137,47 @@ class DialogueEngine:
         if self._active is None:
             return False
         return bool(self._sessions[self._active].safe_mode)
+
+    # ---- 冷记忆检索（doc/07 §4）----
+    def _retrieve_cold(self, sess: _Session, user_text: str, snapshot: WeightSnapshot) -> List[ColdMemoryItem]:
+        """按触发策略检索冷记忆，返回命中的 ColdMemoryItem 列表（doc/07 §4.2/§4.3）。"""
+        if not self.settings.memory_enable:
+            return []
+        if not self._should_retrieve_cold(sess):
+            return []
+        query = self._build_cold_query(user_text, snapshot)
+        try:
+            return self.memory.search(
+                query,
+                top_k=self.settings.memory_cold_top_k,
+                sim_threshold=self.settings.memory_retrieve_sim_threshold,
+                scope="all",
+            )
+        except Exception:  # noqa: BLE001 - 检索失败绝不阻断对话主链路
+            return []
+
+    def _should_retrieve_cold(self, sess: _Session) -> bool:
+        trigger = self.settings.memory_retrieve_trigger
+        period = max(1, self.settings.memory_retrieve_period)
+        if trigger == "always":
+            return True
+        if trigger == "coldstart":
+            return sess.turn <= 2
+        if trigger == "periodic":
+            return sess.turn % period == 0
+        if trigger == "similarity":
+            return True  # 阈值在 search 内部过滤
+        return False
+
+    def _build_cold_query(self, user_text: str, snapshot: WeightSnapshot) -> str:
+        """查询 = 最新发言 + 当前 L2 活跃关键词（加权语义锚点，doc/07 §4.2）。"""
+        parts = [user_text]
+        for k, v in snapshot.l2.items():
+            if v >= 0.3:
+                kw = self.lib.lexicon.get(k)
+                if kw:
+                    parts.append(kw.name)
+        return " ".join(parts)
 
     # ---- 会话生命周期 ----
     def start_session(
@@ -257,8 +302,10 @@ class DialogueEngine:
 
         # 组装 + 预算护栏
         history = list(sess.history_summaries)
+        cold_items = self._retrieve_cold(sess, user_text, snapshot) if self.memory is not None else []
         assembled = self.assembler.assemble(
-            snapshot, scene_name=sess.scene_name, greeting=sess.greeting, history=history
+            snapshot, scene_name=sess.scene_name, greeting=sess.greeting,
+            history=history, cold_memory=[it.display for it in cold_items],
         )
         system_prompt = assembled["system_prompt"]
         chain.append(("assemble", assembled["debug"]))
@@ -301,6 +348,16 @@ class DialogueEngine:
         sess.history_summaries.append(turn_summary or reply_text[:100])
         sess.last_agent_text = reply_text
         sess.pending_summary = ""
+        # 落冷记忆库（doc/07 §4.1 ingestion）：本轮写入，供后续（含跨会话）检索
+        if self.memory is not None:
+            try:
+                importance = max(snapshot.l2.values(), default=0.0)
+                self.memory.add_turn(
+                    sess.sid, sess.turn, user_text, reply_text, turn_summary,
+                    importance=float(importance),
+                )
+            except Exception:  # noqa: BLE001 - 记忆写入失败不影响主流程
+                pass
 
     # ---- 同步一次性入口（CLI / 测试）----
     def send(self, user_text: str) -> Tuple[str, dict]:
