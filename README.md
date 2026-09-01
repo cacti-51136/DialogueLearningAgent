@@ -24,6 +24,7 @@
 - **工具插件化**（doc/08）：统一 Tool 契约 + 原子快照注册表 + 两级路由；`recall_memory` 为首个内置插件。
 - **人格演进受控**（doc/10）：默认关闭、阶梯式、只能渐进不得大幅偏离原始人格锚。
 - **`kw_agent_map` 涌现**（doc/03 §2.15）：从对话中沉淀「情绪/脾性 → Agent 特质」映射，随交互累积。
+- **PyQt 桌面 UI**（doc/04 §4）：三栏界面（会话列表 / 对话区 / 实时三层权重面板），`StreamWorker(QThread)` 流式渲染、多会话切换、思维链可折叠；`pip install -e ".[ui]"` 后可用 `dla-ui` 启动。
 
 ---
 
@@ -53,6 +54,7 @@
 ```
 DialogueLearningAgent/
 ├── apps/cli/main.py          # CLI 入口（argparse；`dla` 命令）
+├── apps/ui/main.py            # PyQt6 三栏桌面 UI（`dla-ui` 命令；需 ui extra）
 ├── config/
 │   ├── keywords/             # 三层关键词白名单 YAML（L1/L2/L3）
 │   ├── scenarios/            # 5 套预设场景模板 YAML
@@ -108,6 +110,15 @@ pip install -e ".[cli,dev]"
 ```
 
 安装后可用 `dla` 命令替代 `python apps/cli/main.py`。
+
+### 4. 桌面 UI（可选）
+
+```bash
+pip install -e ".[ui]"     # 安装 PyQt6
+dla-ui                     # 启动三栏桌面界面
+```
+
+界面左侧为会话列表（支持新建/切换多会话），中间为对话区与实时流式回复，右侧为 L1/L2/L3 三层权重面板（含置信度进度条）与可折叠的思维链。无 `DLA_LLM__API_KEY` 时同样走 `FakeLLMClient` 离线可跑。
 
 ---
 
