@@ -115,6 +115,10 @@ class DialogueEngine:
         if m:
             clean = text[: m.start()] + text[m.end():]
             return clean.strip(), m.group(1).strip()
+        # 防御：仅有开标签无闭标签时，截断到开标签之前，避免标签泄露进回复
+        m2 = re.search(r"<turn_summary>", text)
+        if m2:
+            return text[: m2.start()].strip(), text[: m2.start()].strip()[:100]
         return text.strip(), text.strip()[:100]
 
     def _apply_safe_mode(self, text: str) -> str:
@@ -338,6 +342,7 @@ class DialogueEngine:
         messages = prep["messages"]
         collected: List[str] = []
         emitted_len = 0
+        past_tag = False
         try:
             for tok in self.llm.stream(
                 messages,
@@ -346,14 +351,19 @@ class DialogueEngine:
             ):
                 collected.append(tok)
                 full = "".join(collected)
-                if "<turn_summary>" in full:
-                    idx = full.index("<turn_summary>")
-                    if idx > emitted_len:
-                        yield TokenEvent(text=full[emitted_len:idx])
-                    break
-                if len(full) > emitted_len:
-                    yield TokenEvent(text=full[emitted_len:])
-                    emitted_len = len(full)
+                if not past_tag:
+                    tag_pos = full.find("<turn_summary>")
+                    if tag_pos != -1:
+                        # 回复主体到此为止：推送标签之前的内容，并停止向 UI 推送可见 token；
+                        # 但仍继续收集剩余 token（summary 与闭标签），以便结尾正确切分
+                        if tag_pos > emitted_len:
+                            yield TokenEvent(text=full[emitted_len:tag_pos])
+                        emitted_len = tag_pos
+                        past_tag = True
+                        continue
+                    if len(full) > emitted_len:
+                        yield TokenEvent(text=full[emitted_len:])
+                        emitted_len = len(full)
         except LlmError:
             yield ErrorEvent(message="生成失败，请稍后再试～")
             return

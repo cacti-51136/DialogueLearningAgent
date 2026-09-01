@@ -122,7 +122,8 @@ class MainWindow(QMainWindow):
         )
         repo = None
         try:
-            conn = get_connection(settings.db_path)
+            # UI 在 worker 线程经仓储写库，连接需允许跨线程使用（访问已串行化，doc/04 §4）
+            conn = get_connection(settings.db_path, check_same_thread=False)
             migrate(conn, "migrations")
             repo = SQLiteRepo(conn)
         except Exception:  # noqa: BLE001 - 无 DB 也能跑（内存模式）
