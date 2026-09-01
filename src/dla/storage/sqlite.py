@@ -23,6 +23,8 @@ def get_connection(path: str, check_same_thread: bool = True) -> sqlite3.Connect
     conn = sqlite3.connect(path, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 多线程/多请求并发时避免瞬间 "database is locked"（本地单用户工具足够）
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

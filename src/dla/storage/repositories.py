@@ -155,3 +155,38 @@ class SQLiteRepo:
             TurnSummary(turn=r["turn"], text=r["text"], kind=r["kind"], timestamp=r["created_at"] or 0.0)
             for r in cur.fetchall()
         ]
+
+    # ---- 消息历史（API GET /messages）----
+    def list_messages(self, session_id: str, limit: int = 100) -> List[dict]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT turn, role, content FROM messages WHERE session_id=? ORDER BY rowid ASC LIMIT ?",
+            (session_id, limit),
+        )
+        return [{"turn": r["turn"], "role": r["role"], "content": r["content"]} for r in cur.fetchall()]
+
+    # ---- 权重快照历史（API GET /weights/history）----
+    def list_snapshots(self, session_id: str, limit: int = 200) -> List[dict]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT turn, l1_json, l2_json, l3_json FROM weight_snapshots WHERE session_id=? ORDER BY turn ASC LIMIT ?",
+            (session_id, limit),
+        )
+        return [
+            {
+                "turn": r["turn"],
+                "l1": json.loads(r["l1_json"]),
+                "l2": json.loads(r["l2_json"]),
+                "l3": json.loads(r["l3_json"]),
+            }
+            for r in cur.fetchall()
+        ]
+
+    # ---- 工具调用日志（doc/08 G6）----
+    def log_tool_call(self, session_id: str, tool: str, args_json: str = "{}", ok: int = 1, error: str = "", created_at: Optional[float] = None) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO tool_log(session_id, tool, args_json, ok, error, created_at) VALUES(?,?,?,?,?,?)",
+            (session_id, tool, args_json, int(ok), error, created_at or time.time()),
+        )
+        self.conn.commit()

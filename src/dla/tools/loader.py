@@ -12,7 +12,7 @@ from typing import List
 
 from .protocol import Tool
 
-_PLUGINS_PKG = "src.dla.tools.plugins"
+_PLUGINS_PKG = "dla.tools.plugins"
 
 
 def discover_plugins(plugins_pkg: str = _PLUGINS_PKG) -> List[Tool]:

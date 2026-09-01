@@ -21,10 +21,11 @@
 - **对话历史冷热记忆**（doc/07）：热窗口（`turn_summary` 链注入）+ 冷库 RAG 检索（SQLite，零依赖确定性 embedding，可换 sentence-transformers backbone）+ 跨会话召回；仅作 Prompt「背景参考」注入，不参与权重计算。
 - **上下文自动压缩**（doc/11）：每轮估算整窗 `fill_ratio`，阶梯阈值触发紧凑协议，长会话不撑爆上下文。
 - **回复重复护栏**（doc/04 §2.3）：频率/存在惩罚 + 自重复 n-gram 检测，自动降级重生成。
-- **工具插件化**（doc/08）：统一 Tool 契约 + 原子快照注册表 + 两级路由；`recall_memory` 为首个内置插件。
+- **工具插件化**（doc/08）：统一 Tool 契约 + 原子快照注册表 + 两级路由；`recall_memory` 为首个内置插件，支持按 query **语义召回**历史原文/摘要（按需取回原文，只读）。
 - **人格演进受控**（doc/10）：默认关闭、阶梯式、只能渐进不得大幅偏离原始人格锚。
 - **`kw_agent_map` 涌现**（doc/03 §2.15）：从对话中沉淀「情绪/脾性 → Agent 特质」映射，随交互累积。
 - **PyQt 桌面 UI**（doc/04 §4）：三栏界面（会话列表 / 对话区 / 实时三层权重面板），`StreamWorker(QThread)` 流式渲染、多会话切换、思维链可折叠；`pip install -e ".[ui]"` 后可用 `dla-ui` 启动。
+- **HTTP API（doc/04 §3）**：FastAPI 薄适配层，复用同一核心引擎；`/v1/sessions` 生命周期、消息发送支持 SSE 流式（`token`/`weights`/`persona_change`/`done` 事件）、权重与历史查询、`/v1/tools` 工具调用；CORS 白名单 + 统一安全头；`pip install -e ".[api]"` 后 `dla-api` 启动（默认 `127.0.0.1:8000`）。
 
 ---
 
@@ -55,6 +56,7 @@
 DialogueLearningAgent/
 ├── apps/cli/main.py          # CLI 入口（argparse；`dla` 命令）
 ├── apps/ui/main.py            # PyQt6 三栏桌面 UI（`dla-ui` 命令；需 ui extra）
+├── apps/api/main.py           # FastAPI/SSE 适配层（`dla-api` 命令；需 api extra）
 ├── config/
 │   ├── keywords/             # 三层关键词白名单 YAML（L1/L2/L3）
 │   ├── scenarios/            # 5 套预设场景模板 YAML
@@ -120,6 +122,29 @@ dla-ui                     # 启动三栏桌面界面
 
 界面左侧为会话列表（支持新建/切换多会话），中间为对话区与实时流式回复，右侧为 L1/L2/L3 三层权重面板（含置信度进度条）与可折叠的思维链。无 `DLA_LLM__API_KEY` 时同样走 `FakeLLMClient` 离线可跑。
 
+### 5. HTTP API（可选）
+
+```bash
+pip install -e ".[api]"     # 安装 fastapi / uvicorn / sse-starlette
+dla-api                     # 启动服务（默认 127.0.0.1:8000）
+```
+
+主要端点：
+
+```bash
+curl -N -H "Accept: text/event-stream" \
+  -X POST localhost:8000/v1/sessions/<sid>/messages -H 'Content-Type: application/json' \
+  -d '{"text":"你好"}'        # SSE 流式（event: token / weights / persona_change / done）
+
+curl localhost:8000/v1/sessions                 # 会话列表
+curl localhost:8000/v1/scenarios               # 场景模板
+curl localhost:8000/v1/tools                   # 已注册工具
+curl -X POST localhost:8000/v1/sessions/<sid>/tools/recall_memory \
+  -H 'Content-Type: application/json' -d '{"args":{"query":"我之前提过的母语"}}'
+```
+
+CORS 默认关闭跨域（生产禁用 `*`），可用 `DLA_API__CORS_ORIGINS=http://localhost:3000` 显式放行来源。
+
 ---
 
 ## 配置
@@ -141,6 +166,8 @@ dla-ui                     # 启动三栏桌面界面
 | 默认场景 | `DLA_SCENARIO__DEFAULT` | `oral_practice` | `fixed` 模式默认加载 |
 | 人格演进开关 | `DLA_PERSONA__AUTO_UPDATE` | `False` | 默认关闭（doc/10） |
 | 工具启用 | `DLA_TOOLS__ENABLED` | `True` | 插件化工具系统 |
+| API 监听地址/端口 | `DLA_API__HOST` / `DLA_API__PORT` | `127.0.0.1` / `8000` | `dla-api` 启动参数 |
+| API CORS 白名单 | `DLA_API__CORS_ORIGINS` | 空（不跨域） | 逗号分隔显式来源，生产禁用 `*` |
 | 重复护栏降级语 | `DLA_REPEAT__DEGRADE_MSG` | （见源码） | 检测到循环时回退话术 |
 
 > 完整字段见 `src/dla/config/settings.py`（全部 `DLA_*` 及其默认值与类型转换）。

@@ -173,6 +173,11 @@ class Settings:
     log_json: bool = True
     log_log_content: bool = False
 
+    # ---- API 服务（doc/04 §3）----
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
+    api_cors_origins: str = ""  # 逗号分隔的显式来源白名单；留空=不开放跨域（生产禁用 *）
+
     # ---- kw_agent_map（doc/03 §2.15）----
     kwmap_delta: float = 0.15
     kwmap_lr: float = 0.05
@@ -311,6 +316,9 @@ class Settings:
             log_level=env("DLA_LOG__LEVEL", "INFO"),
             log_json=env("DLA_LOG__JSON", True, _as_bool),
             log_log_content=env("DLA_LOG__LOG_CONTENT", False, _as_bool),
+            api_host=env("DLA_API__HOST", "127.0.0.1"),
+            api_port=env("DLA_API__PORT", 8000, int),
+            api_cors_origins=env("DLA_API__CORS_ORIGINS", ""),
             kwmap_delta=env("DLA_KWMAP__DELTA", 0.15, float),
             kwmap_lr=env("DLA_KWMAP__LR", 0.05, float),
             kwmap_dmax=env("DLA_KWMAP__DMAX", 0.30, float),

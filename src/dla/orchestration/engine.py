@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -38,6 +39,8 @@ from ..core.ports import ChatMessage
 from ..evolution import CandidateRegistry, discover_from_extractions
 from ..memory import build_memory
 from ..memory.store import ColdMemoryItem
+from ..tools.executor import run_tool
+from ..tools.protocol import ToolContext, ToolResult, validate_args as _validate_tool_args
 from ..prompt.assembler import PromptAssembler
 from ..prompt.context_compact import ContextWindow, compact, fill_ratio
 from ..prompt.budget import estimate_tokens
@@ -75,7 +78,7 @@ class _Session:
 
 
 class DialogueEngine:
-    def __init__(self, settings, lib, llm_client, repo=None, clock=None) -> None:
+    def __init__(self, settings, lib, llm_client, repo=None, clock=None, tool_registry=None) -> None:
         self.settings = settings
         self.lib = lib
         self.llm = llm_client
@@ -90,6 +93,8 @@ class DialogueEngine:
         )
         # 冷记忆库（doc/07）：复用引擎已有的 SQLite 连接；无 repo（内存模式）时置 None
         self.memory = build_memory(self.repo.conn, self.settings) if self.repo is not None else None
+        # 工具注册表（doc/08）：可选；引擎只消费契约，不参与工具实现
+        self.tool_registry = tool_registry
         # 多会话：sid -> 运行时状态
         self._sessions: Dict[str, _Session] = {}
         self._active: Optional[str] = None
@@ -542,6 +547,59 @@ class DialogueEngine:
             if dst.startswith("user_"):
                 continue
             self.repo.kwmap_upsert(src, dst, "boost", w, learn_rate=self.settings.kwmap_lr)
+
+    # ---- 工具插件（doc/08）----
+    def list_tools(self) -> List[dict]:
+        """列出已注册工具（供 API / CLI 展示）。"""
+        if self.tool_registry is None:
+            return []
+        return [
+            {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+                "dangerous": t.dangerous,
+            }
+            for t in self.tool_registry.all()
+        ]
+
+    def call_tool(self, name: str, args: dict, session_id: Optional[str] = None, timeout: float = 10.0) -> ToolResult:
+        """按需调用工具（doc/08 §5）。
+
+        进行中对话在轮次开始处 ``snapshot`` 捕获当前工具集引用，热更新不影响正在跑的对话；
+        执行经 ``validate_args`` 校验与 ``run_tool`` 超时熔断；调用记入 ``tool_log``（doc/08 G6）。
+        """
+        if self.tool_registry is None:
+            return ToolResult(ok=False, error="工具系统未启用")
+        sid = session_id or (self._active if self._active else "session-0")
+        ctx = ToolContext(
+            session_id=sid,
+            repo=self.repo,
+            settings=self.settings,
+            memory=self.memory,
+            clock=self.clock,
+            llm=self.llm,
+        )
+        # 原子快照：持旧引用，热更新不影响本次调用
+        version = self.tool_registry.snapshot()
+        tools = self.tool_registry.get_snapshot(version)
+        tool = tools.get(name)
+        if tool is None:
+            return ToolResult(ok=False, error=f"未找到工具: {name}")
+        err = _validate_tool_args(tool, args)
+        if err:
+            return ToolResult(ok=False, error=err)
+        result = run_tool(tool, args, ctx, timeout=timeout)
+        if self.repo is not None:  # 可观测：tool_log
+            try:
+                self.repo.log_tool_call(
+                    sid, name,
+                    json.dumps(args, ensure_ascii=False),
+                    int(result.ok), result.error or "",
+                )
+            except Exception:  # noqa: BLE001 - 日志失败不影响主流程
+                pass
+        return result
 
 
 def _jaccard_chars(a: str, b: str) -> float:
