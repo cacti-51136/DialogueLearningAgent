@@ -84,7 +84,7 @@ def _build_engine() -> DialogueEngine:
         repo = SQLiteRepo(conn)
     except Exception:  # noqa: BLE001 - 无 DB 也能跑（内存模式）
         repo = None
-    engine = DialogueEngine(settings, lib, llm, repo)
+    engine = DialogueEngine(settings, lib, llm, repo, tool_registry=None)
     if settings.tools_enabled:
         try:
             engine.tool_registry = build_builtin_registry()

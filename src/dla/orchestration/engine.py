@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -42,7 +43,7 @@ from ..memory.store import ColdMemoryItem
 from ..tools.executor import run_tool
 from ..tools.protocol import ToolContext, ToolResult, validate_args as _validate_tool_args
 from ..prompt.assembler import PromptAssembler
-from ..prompt.context_compact import ContextWindow, compact, fill_ratio
+from ..prompt.context_compact import ContextWindow, compact, fill_ratio, window_parts
 from ..prompt.budget import estimate_tokens
 from ..weighting.coupling import apply_rules
 from ..weighting.engine import WeightEngine, WeightEngineConfig
@@ -200,7 +201,11 @@ class DialogueEngine:
             session_id=sess.sid, repo=self.repo, settings=self.settings,
             memory=self.memory, clock=self.clock, llm=self.llm,
         )
-        for t in self.tool_registry.all():
+        # 捕获当前快照引用：本轮后续即便发生热更新也用这一份（doc/08 §3.1）
+        snap = self.tool_registry.snapshot()
+        for t in snap.values():
+            if not self.tool_registry.is_enabled(t.name):
+                continue  # 已禁用（含危险工具未显式 enable）不暴露给 LLM
             tool_schema_parts.append(f"- {t.name}: {t.description}")
             if not t.is_readonly:
                 continue  # 有副作用工具不自动触发
@@ -344,34 +349,50 @@ class DialogueEngine:
         # 组装 + 预算护栏
         history = list(sess.history_summaries)
         cold_items = self._retrieve_cold(sess, user_text, snapshot) if self.memory is not None else []
+        cold_displays = [it.display for it in cold_items]
         detail_blocks, tool_schema, invoked_tools = self._run_tool_step(sess, user_text)
         assembled = self.assembler.assemble(
             snapshot, scene_name=sess.scene_name, greeting=sess.greeting,
-            history=history, cold_memory=[it.display for it in cold_items],
+            history=history, cold_memory=cold_displays,
             detail_blocks=detail_blocks, tool_schema=tool_schema,
         )
+        core = assembled["core"]
         system_prompt = assembled["system_prompt"]
         chain.append(("tools", {"invoked": invoked_tools}))
         chain.append(("assemble", assembled["debug"]))
 
+        # ⑦ budget_guard（doc-11 §3 step 7½）：核心段 + 各附加段独立计 token，避免双重计数
         window = ContextWindow(
-            system_prompt=system_prompt, history=history, cold_memory=[],
-            detail_blocks=[], tool_schema="", current_user_msg=user_text,
+            system_prompt=core, history=history, cold_memory=cold_displays,
+            detail_blocks=detail_blocks, tool_schema=tool_schema,
+            current_user_msg=user_text,
         )
         ratio = fill_ratio(window, self.settings)
+        parts = window_parts(window, self.settings)  # 分项估算（doc-11 §9 调试帧）
         compact_actions: List[str] = []
         if self.settings.ctx_auto_compact and ratio >= self.settings.ctx_compact_ratio:
             new_window, actions = compact(window, self.settings)
             compact_actions = actions
-            system_prompt = new_window.system_prompt
+            # 用压缩后的字段【重新组装】system_prompt（修复此前只改 window 不重组的空操作 bug）
+            new_extras = self.assembler.format_extras(
+                history=new_window.history, cold_memory=new_window.cold_memory,
+                detail_blocks=new_window.detail_blocks, tool_schema=new_window.tool_schema,
+            )
+            system_prompt = self.assembler.render_system(core, new_extras)
             sess.history_summaries = list(new_window.history)
             history = list(new_window.history)
             ratio_after = fill_ratio(new_window, self.settings)
             if self.repo is not None:
-                self.repo.log_compact(sess.sid, sess.turn, ratio, ratio_after, actions)
-            chain.append(("budget_guard", {"ratio_before": round(ratio, 3), "actions": actions, "ratio_after": round(ratio_after, 3)}))
+                try:
+                    self.repo.log_compact(sess.sid, sess.turn, ratio, ratio_after, actions)
+                except Exception:  # noqa: BLE001 - 日志失败不影响主流程
+                    pass
+            chain.append(("budget_guard", {
+                "ratio_before": round(ratio, 3), "actions": actions,
+                "ratio_after": round(ratio_after, 3), "parts_before": parts,
+            }))
         else:
-            chain.append(("budget_guard", {"ratio": round(ratio, 3), "triggered": False}))
+            chain.append(("budget_guard", {"ratio": round(ratio, 3), "triggered": False, "parts": parts}))
 
         messages = [
             ChatMessage(role="system", content=system_prompt),
@@ -381,6 +402,7 @@ class DialogueEngine:
             "snapshot": snapshot, "chain": chain, "messages": messages,
             "notify": notify, "rebuild": rebuild, "delta": delta,
             "compact_actions": compact_actions, "new_candidates": new_candidates, "now": now,
+            "invoked_tools": invoked_tools,
         }
 
     def _persist(self, sess: _Session, user_text: str, reply_text: str, turn_summary: str, snapshot: WeightSnapshot, now: float) -> None:
@@ -410,6 +432,40 @@ class DialogueEngine:
         prep = self._prepare_turn(sess, user_text, now)
         messages = prep["messages"]
         reply_text, turn_summary, rep_hit = self._generate_with_guard(sess, messages, user_text)
+        # ---- LLM function-calling 二级路由（doc/08 §4.3）----
+        # 若 LLM 在回复中以 <tool_call> 语法显式指定调用，经 registry 派发执行，结果回灌后重生成；
+        # TOOL_MAX_LOOPS 防死循环。与本轮自动触发的只读工具去重。
+        already_invoked = set(prep.get("invoked_tools", []))
+        executed: List[Tuple[str, bool]] = []
+        if self.settings.tools_enabled and self.tool_registry is not None:
+            calls = self._parse_tool_calls(reply_text)
+            if calls:
+                loop_messages = list(messages)
+                loop_assistant = reply_text
+                loops = 0
+                while calls and loops < self.settings.memory_tool_max_loops:
+                    results = self._run_tool_calls(sess, calls, already_invoked)
+                    executed = [(n, r.ok) for n, r in results]
+                    block = self._tool_results_block(results)
+                    if not block:
+                        break
+                    loop_messages = loop_messages + [
+                        ChatMessage(role="assistant", content=loop_assistant),
+                        ChatMessage(role="user", content="（工具返回结果）\n" + block + "\n请据此给出最终回应。"),
+                    ]
+                    try:
+                        regen = self.llm.complete(
+                            loop_messages,
+                            frequency_penalty=self.settings.repeat_freq_penalty,
+                            presence_penalty=self.settings.repeat_presence_penalty,
+                        ).content
+                    except Exception:  # noqa: BLE001
+                        break
+                    loop_assistant, _ = self._split_summary(regen)
+                    reply_text = loop_assistant
+                    calls = self._parse_tool_calls(loop_assistant)
+                    loops += 1
+                prep["chain"].append(("tool_calls", {"executed": executed}))
         reply_text = self._apply_safe_mode(reply_text)
         sess.recent_replies.append(reply_text)
         sess.recent_replies = sess.recent_replies[-self.settings.repeat_recent_n:]
@@ -619,10 +675,9 @@ class DialogueEngine:
             clock=self.clock,
             llm=self.llm,
         )
-        # 原子快照：持旧引用，热更新不影响本次调用
-        version = self.tool_registry.snapshot()
-        tools = self.tool_registry.get_snapshot(version)
-        tool = tools.get(name)
+        # 原子快照：持旧引用，热更新不影响本次调用（doc/08 §3.1）
+        snap = self.tool_registry.snapshot()
+        tool = snap.get(name)
         if tool is None:
             return ToolResult(ok=False, error=f"未找到工具: {name}")
         err = _validate_tool_args(tool, args)
@@ -639,6 +694,99 @@ class DialogueEngine:
             except Exception:  # noqa: BLE001 - 日志失败不影响主流程
                 pass
         return result
+
+    # ---- LLM function-calling 二级路由（doc/08 §4.3）----
+    _TOOL_CALL_RE = re.compile(
+        r"<tool_call\s+name=\"([^\"]+)\"\s+args=('|\")(.*?)\2\s*/?>", re.S
+    )
+
+    def _parse_tool_calls(self, text: str) -> List[Tuple[str, dict]]:
+        """解析 LLM 回复中的 function-calling 语法 ``<tool_call name="x" args='{...}' />``。
+
+        返回 ``[(name, args_dict), ...]``；args 解析失败则跳过该条（不阻断对话）。
+        """
+        out: List[Tuple[str, dict]] = []
+        for m in self._TOOL_CALL_RE.finditer(text or ""):
+            name = m.group(1)
+            raw = m.group(3)
+            try:
+                args = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                # 兼容无 JSON 的裸参（如 args='关键词'）
+                args = {"query": raw} if raw else {}
+            if isinstance(args, dict):
+                out.append((name, args))
+        return out
+
+    def _run_tool_calls(self, sess: _Session, calls: List[Tuple[str, dict]], already_invoked: set) -> List[Tuple[str, ToolResult]]:
+        """派发 LLM 选定的工具调用（doc/08 §4.3）。
+
+        - 只读工具或已显式 enable 的工具方可执行；危险/disabled 工具拒绝并记错误。
+        - 与自动触发去重（``already_invoked`` 含本轮已自动触发的只读工具），避免重复调用。
+        - 经 ``call_tool`` → validate_args + 超时熔断 + tool_log。
+        """
+        results: List[Tuple[str, ToolResult]] = []
+        if self.tool_registry is None:
+            return results
+        for name, args in calls:
+            if name in already_invoked:
+                continue
+            tool = self.tool_registry.get(name)
+            if tool is None:
+                if self.tool_registry is not None and self.tool_registry.is_registered(name):
+                    results.append((name, ToolResult(ok=False, error=f"工具已禁用（危险工具需显式 enable）: {name}")))
+                else:
+                    results.append((name, ToolResult(ok=False, error=f"未找到工具: {name}")))
+                continue
+            if not tool.is_readonly and not self.tool_registry.is_enabled(name):
+                results.append((name, ToolResult(ok=False, error=f"危险工具需显式 enable: {name}")))
+                continue
+            res = self.call_tool(name, args, session_id=sess.sid)
+            results.append((name, res))
+            already_invoked.add(name)
+        return results
+
+    @staticmethod
+    def _tool_results_block(results: List[Tuple[str, ToolResult]]) -> str:
+        parts = []
+        for name, res in results:
+            if res.ok and res.content:
+                parts.append(f"[{name}] {res.content}")
+        return "\n".join(parts)
+
+    def force_compact(self, sid: Optional[str] = None) -> Optional[dict]:
+        """手动触发一次上下文压缩（doc-11；CLI ``dla ctx compact --force`` 用）。
+
+        返回 ``{"triggered", "ratio_before", "ratio_after", "actions"}``；未达阈值则 triggered=False。
+        """
+        sid = sid or self._active
+        if sid is None or sid not in self._sessions:
+            return None
+        sess = self._sessions[sid]
+        history = list(sess.history_summaries)
+        snapshot = sess.engine.compute_all(sess.turn)
+        assembled = self.assembler.assemble(
+            snapshot, scene_name=sess.scene_name, greeting=sess.greeting,
+            history=history, cold_memory=[], detail_blocks=[], tool_schema="",
+        )
+        core = assembled["core"]
+        window = ContextWindow(
+            system_prompt=core, history=history, cold_memory=[],
+            detail_blocks=[], tool_schema="", current_user_msg="",
+        )
+        ratio_before = fill_ratio(window, self.settings)
+        if ratio_before < self.settings.ctx_compact_ratio:
+            return {"triggered": False, "ratio_before": ratio_before, "ratio_after": ratio_before, "actions": []}
+        new_window, actions = compact(window, self.settings)
+        # 手动压缩：更新会话摘要链（原文已落冷库无损），并记入日志
+        sess.history_summaries = list(new_window.history)
+        ratio_after = fill_ratio(new_window, self.settings)
+        if self.repo is not None:
+            try:
+                self.repo.log_compact(sess.sid, sess.turn, ratio_before, ratio_after, actions)
+            except Exception:  # noqa: BLE001
+                pass
+        return {"triggered": True, "ratio_before": ratio_before, "ratio_after": ratio_after, "actions": actions}
 
 
 def _jaccard_chars(a: str, b: str) -> float:

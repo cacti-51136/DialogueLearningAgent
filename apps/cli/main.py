@@ -34,8 +34,18 @@ from src.dla.orchestration.engine import DialogueEngine  # noqa: E402
 from src.dla.storage.migrator import migrate  # noqa: E402
 from src.dla.storage.repositories import SQLiteRepo  # noqa: E402
 from src.dla.storage.sqlite import get_connection  # noqa: E402
-from src.dla.tools.loader import discover_plugins  # noqa: E402
+from src.dla.tools.loader import discover_all  # noqa: E402
 from src.dla.tools.registry import ToolRegistry  # noqa: E402
+from src.dla.tools.watcher import HotReloadWatcher  # noqa: E402
+
+
+def _build_registry(settings) -> ToolRegistry:
+    """扫描插件目录 + entry_points 构建工具注册表（doc/08）。"""
+    registry = ToolRegistry()
+    if settings.tools_enabled:
+        discovered = discover_all()
+        registry.load_from(discovered)
+    return registry
 
 
 def _build_engine(args, with_db: bool = True, force_fake: bool = False):
@@ -56,8 +66,25 @@ def _build_engine(args, with_db: bool = True, force_fake: bool = False):
         conn = get_connection(settings.db_path)
         migrate(conn, "migrations")
         repo = SQLiteRepo(conn)
-    engine = DialogueEngine(settings, lib, llm, repo)
-    return settings, lib, llm, repo, engine
+    registry = _build_registry(settings)
+    engine = DialogueEngine(settings, lib, llm, repo, tool_registry=registry)
+    return settings, lib, llm, repo, engine, registry
+
+
+def _maybe_start_watcher(settings, registry):
+    """若配置了自动热更新，启动监听线程（doc/08 §3.2）。返回 watcher 或 None。"""
+    mode = settings.tools_auto_reload
+    if mode not in ("watch", "shadow"):
+        return None
+    plugin_dir = settings.tools_plugin_dir
+    if not os.path.isabs(plugin_dir):
+        plugin_dir = os.path.join(_PROJ_ROOT, plugin_dir)
+    watcher = HotReloadWatcher(
+        registry, plugin_dir, mode=mode,
+        on_reload=lambda r: None,
+    )
+    watcher.start()
+    return watcher
 
 
 def _print_weights(snapshot) -> None:
@@ -74,7 +101,8 @@ def _print_chain(chain) -> None:
 
 # ----------------------------- chat -----------------------------
 def cmd_chat(args) -> int:
-    settings, lib, llm, repo, engine = _build_engine(args, with_db=not args.no_db)
+    settings, lib, llm, repo, engine, registry = _build_engine(args, with_db=not args.no_db)
+    watcher = _maybe_start_watcher(settings, registry)
     mode = args.mode or settings.mode_scenario
     scenario = args.scenario or settings.scenario_default
     greeting = engine.start_session(mode=mode, scenario_id=scenario, describe=args.describe)
@@ -82,13 +110,15 @@ def cmd_chat(args) -> int:
     print("Agent:", greeting)
 
     if args.message:
-        reply, meta = engine.send(args.message)
-        print("Agent:", reply)
-        if args.explain:
-            _print_weights(meta["snapshot"])
-        if args.debug:
-            _print_chain(meta["debug_chain"])
-        return 0
+            reply, meta = engine.send(args.message)
+            print("Agent:", reply)
+            if args.explain:
+                _print_weights(meta["snapshot"])
+            if args.debug:
+                _print_chain(meta["debug_chain"])
+            if watcher is not None:
+                watcher.stop()
+            return 0
 
     print("（输入 /exit 结束）")
     while True:
@@ -107,6 +137,8 @@ def cmd_chat(args) -> int:
             _print_weights(meta["snapshot"])
         if args.debug:
             _print_chain(meta["debug_chain"])
+    if watcher is not None:
+        watcher.stop()
     return 0
 
 
@@ -190,6 +222,20 @@ def cmd_ctx(args) -> int:
         print(f"compact_ratio 阈值: {settings.ctx_compact_ratio}  hard: {settings.ctx_hard_ratio}  auto: {settings.ctx_auto_compact}")
         return 0
     if args.sub == "compact":
+        if getattr(args, "force", False):
+            # 真正触发一次压缩（doc/11 §8.1）：构建引擎并强制 compact 当前会话
+            _s, _l, _r, _repo, engine, _reg = _build_engine(args, with_db=True)
+            engine.start_session()
+            res = engine.force_compact()
+            if res is None:
+                print("（无法执行压缩：无活动会话）")
+                return 1
+            if not res["triggered"]:
+                print(f"未达阈值，无需压缩（ratio_before={res['ratio_before']:.3f} < {settings.ctx_compact_ratio}）")
+            else:
+                print(f"已强制压缩：ratio {res['ratio_before']:.3f}→{res['ratio_after']:.3f}")
+                print(f"动作: {res['actions']}")
+            return 0
         cur.execute("SELECT turn, ratio_before, ratio_after, actions_json FROM context_compact_log ORDER BY turn DESC LIMIT 20")
         rows = cur.fetchall()
         if not rows:
@@ -200,10 +246,64 @@ def cmd_ctx(args) -> int:
     print("未知 ctx 子命令"); return 2
 
 
+# ----------------------------- tool -----------------------------
+def cmd_tool(args) -> int:
+    settings = get_settings()
+    registry = _build_registry(settings)
+    if args.sub == "list":
+        if not registry.snapshot():
+            print("（未加载任何工具插件）")
+            return 0
+        for t in registry.all():
+            state = "禁用" if not registry.is_enabled(t.name) else "启用"
+            ro = "只读" if t.is_readonly else "有副作用"
+            print(f"{t.name:24} v{getattr(t, 'version', '?')}  [{state}/{ro}]  {t.description[:42]}")
+        return 0
+    if args.sub == "describe":
+        t = registry.get(args.name)
+        if t is None:
+            print(f"未找到工具: {args.name}")
+            return 1
+        print(f"name: {t.name}")
+        print(f"version: {getattr(t, 'version', '?')}")
+        print(f"readonly: {t.is_readonly}  enabled: {registry.is_enabled(t.name)}")
+        print(f"description: {t.description}")
+        print(f"parameters: {json.dumps(t.parameters, ensure_ascii=False)}")
+        return 0
+    if args.sub == "reload":
+        result = registry.reload(args.name, shadow=args.shadow)
+        if result["ok"]:
+            if result["shadow"]:
+                print(f"已载入影子快照（观测中），用 `dla tool promote {args.name or ''}` 确认切换")
+            else:
+                print(f"重载成功：生效工具 {result['count']} 个")
+        else:
+            print(f"重载失败（已回滚）：{result['error']}")
+            return 1
+        return 0
+    if args.sub == "promote":
+        result = registry.promote_shadow()
+        if result["ok"]:
+            print(f"影子快照已提升为生效快照，共 {result['count']} 个工具")
+        else:
+            print(f"提升失败：{result['error']}")
+            return 1
+        return 0
+    if args.sub in ("enable", "disable"):
+        on = args.sub == "enable"
+        ok = registry.set_enabled(args.name, on)
+        if not ok:
+            print(f"未找到工具: {args.name}")
+            return 1
+        print(f"{args.name} 已{'启用' if on else '禁用'}")
+        return 0
+    print("未知 tool 子命令"); return 2
+
+
 # ---------------------------- bench ----------------------------
 def cmd_bench(args) -> int:
     # 强制 FakeLLM：bench 是确定性离线回归，不依赖/不触碰真实 API
-    settings, lib, llm, repo, engine = _build_engine(args, with_db=False, force_fake=True)
+    settings, lib, llm, repo, engine, _registry = _build_engine(args, with_db=False, force_fake=True)
     engine.start_session(mode="fixed", scenario_id="oral_practice")
     script = [
         "你好，我想练口语。",
@@ -264,6 +364,16 @@ def build_parser() -> argparse.ArgumentParser:
     pxs = px.add_subparsers(dest="sub")
     pxs.add_parser("status")
     pxc = pxs.add_parser("compact")
+    pxc.add_argument("--force", action="store_true", help="真正触发一次压缩（doc/11）")
+
+    pt = sub.add_parser("tool", help="工具插件管理（doc/08）")
+    pts = pt.add_subparsers(dest="sub")
+    pts.add_parser("list")
+    ptd = pts.add_parser("describe"); ptd.add_argument("name")
+    ptr = pts.add_parser("reload"); ptr.add_argument("name", nargs="?", default=None); ptr.add_argument("--shadow", action="store_true", help="载入影子快照（观测中），需在同进程 promote 才可生效；CLI 单发命令默认直接重载")
+    pts.add_parser("promote")
+    pte = pts.add_parser("enable"); pte.add_argument("name")
+    ptd2 = pts.add_parser("disable"); ptd2.add_argument("name")
 
     pb = sub.add_parser("bench", help="离线剧本回归")
     pb.add_argument("--no-db", action="store_true")
@@ -282,6 +392,8 @@ def main(argv: Optional[list] = None) -> int:
         return cmd_keyword(args)
     if args.cmd == "ctx":
         return cmd_ctx(args)
+    if args.cmd == "tool":
+        return cmd_tool(args)
     if args.cmd == "bench":
         return cmd_bench(args)
     parser.print_help()

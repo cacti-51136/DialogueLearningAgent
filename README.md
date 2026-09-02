@@ -180,9 +180,13 @@ CORS 默认关闭跨域（生产禁用 `*`），可用 `DLA_API__CORS_ORIGINS=ht
 dla chat      对话（--mode fixed|auto|free / --scenario / --message / --explain / --debug / --no-db）
 dla scenario  list | show <id> | validate | export
 dla keyword   map list | map reset      # kw_agent_map 涌现映射
-dla ctx       status | compact          # 上下文压缩日志
+dla ctx       status | compact [--force]  # 压缩日志；--force 强制压缩当前会话（doc/11）
+dla tool      list | describe <name> | reload [name] [--shadow] \
+            | promote | enable <name> | disable <name>   # 工具插件管理（doc/08）
 dla bench                           # 离线剧本回归（强制 FakeLLM，断言权重演化）
 ```
+
+> 工具安全：只读工具（如 `recall_memory`）默认启用、可在主循环自动触发；有副作用/危险工具默认禁用，须 `dla tool enable <name>` 显式开启。`reload` 默认直接重载生效；`--shadow` 仅载入影子快照、需在同进程 `promote` 才正式切换（用于灰度观测）。热更新监听由 `DLA_TOOLS__AUTO_RELOAD=off|watch|manual` 与 `DLA_TOOLS__HOTRELOAD_SHADOW` 控制。
 
 示例：
 

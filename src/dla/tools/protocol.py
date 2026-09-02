@@ -46,6 +46,7 @@ class Tool:
     dangerous: bool = False
     is_readonly: bool = True  # 只读工具可自动触发（doc-08 §5）；有副作用工具应显式设为 False
     can_handle: Callable[[str, ToolContext], float] = _default_can_handle  # 路由评分（0~1；>=阈值才自动触发）
+    version: str = "0.1.0"  # 语义化版本；tool_log 记版本，配合 checkpoint 可精确复现（doc/08 §3.4）
 
 
 # 极简 JSON-Schema 校验（避免引入 jsonschema 依赖；仅校验必填项与基础类型）

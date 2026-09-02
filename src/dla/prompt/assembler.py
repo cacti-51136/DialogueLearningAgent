@@ -94,7 +94,38 @@ class PromptAssembler:
             "l2": L2,
             "l3": L3,
         }
-        return {"system_prompt": system_prompt, "debug": debug}
+        return {"system_prompt": system_prompt, "core": core, "extras": extras, "debug": debug}
+
+    def format_extras(
+        self,
+        history: Optional[List[str]] = None,
+        cold_memory: Optional[List[str]] = None,
+        detail_blocks: Optional[List[str]] = None,
+        tool_schema: str = "",
+    ) -> List[str]:
+        """把附加段（独立于核心段）渲染为区块列表（doc/11 压缩后重组装复用）。"""
+        history = history or []
+        cold_memory = cold_memory or []
+        detail_blocks = detail_blocks or []
+        total = max(1, int(self.cfg.prompt_total_token_budget))
+        extras: List[str] = []
+        if history:
+            extras.append("历史摘要：\n" + "\n".join(history))
+        cold_budget = budget_for_layer(total, self.cfg.memory_prompt_ratio)
+        if cold_memory:
+            cold_text = "；".join(cold_memory)
+            if estimate_tokens(cold_text) > cold_budget:
+                cold_text = cold_text[: cold_budget * 3] + "…"
+            extras.append("背景参考：\n" + cold_text)
+        if detail_blocks:
+            extras.append("补充细节：\n" + "\n".join(detail_blocks))
+        if tool_schema:
+            extras.append(tool_schema)
+        return extras
+
+    def render_system(self, core: str, extras: List[str]) -> str:
+        """核心段 + 附加段组装为最终 System Prompt（压缩后重组装用）。"""
+        return core + ("\n\n" + "\n\n".join(extras) if extras else "")
 
     def _block(self, weights: Dict[str, float], layer: Layer, title: str) -> str:
         segs = render_segments(weights, self.lexicon, layer)

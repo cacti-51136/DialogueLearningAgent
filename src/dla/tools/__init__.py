@@ -6,10 +6,8 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 from .executor import run_tool
-from .loader import discover_plugins
+from .loader import discover_all, discover_directory, discover_entry_points
 from .protocol import Tool, ToolContext, ToolResult, validate_args
 from .registry import ToolRegistry
 from .router import route
@@ -22,18 +20,19 @@ __all__ = [
     "ToolRegistry",
     "run_tool",
     "route",
-    "discover_plugins",
+    "discover_all",
+    "discover_directory",
+    "discover_entry_points",
     "build_builtin_registry",
 ]
 
 
-def build_builtin_registry() -> ToolRegistry:
+def build_builtin_registry(include_entry_points: bool = True) -> ToolRegistry:
     """构建内置工具注册表（doc/08 §5）。
 
-    优先用 ``discover_plugins`` 扫描 ``dla.tools.plugins`` 下所有 ``TOOL`` 实例；
-    任一插件加载失败不影响其他。返回已注册的 :class:`ToolRegistry`。
+    扫描 ``dla.tools.plugins`` 目录 + entry_points 发行包（doc/08 §2），加载失败单插件隔离；
+    返回已 ``load_from`` 的 :class:`ToolRegistry`（原子快照就绪，可进行热更新）。
     """
     reg = ToolRegistry()
-    for tool in discover_plugins():
-        reg.register(tool)
+    reg.load_from(discover_all(include_entry_points=include_entry_points))
     return reg

@@ -32,7 +32,11 @@ class ContextWindow:
 
 
 def fill_ratio(window: ContextWindow, cfg) -> float:
-    """估算整窗 token 占比（doc/11 §3）。"""
+    """估算整窗 token 占比（doc/11 §3）。
+
+    ``system_prompt`` 此处只含**核心段**（角色/用户肖像/交流风格），历史/冷记忆/细节/工具
+    schema 为独立字段，各计一次，避免与已嵌进 system_prompt 的内容重复计数。
+    """
     total_tokens = (
         estimate_tokens(window.system_prompt)
         + estimate_tokens("\n".join(window.history))
@@ -45,6 +49,18 @@ def fill_ratio(window: ContextWindow, cfg) -> float:
     return total_tokens / budget
 
 
+def window_parts(window: ContextWindow, cfg) -> dict:
+    """分项 token 估算（doc-11 §9 调试帧：system / summary链 / cold / detail / tool / 当前）。"""
+    return {
+        "system_core": estimate_tokens(window.system_prompt),
+        "summary_chain": estimate_tokens("\n".join(window.history)),
+        "cold": estimate_tokens("\n".join(window.cold_memory)),
+        "detail": estimate_tokens("\n".join(window.detail_blocks)),
+        "tool": estimate_tokens(window.tool_schema),
+        "current": estimate_tokens(window.current_user_msg),
+    }
+
+
 def compact(window: ContextWindow, cfg) -> Tuple[ContextWindow, List[str]]:  # noqa: C901
     """执行一次紧凑协议，返回新窗口与已执行动作日志（doc/11 §4）。
 
@@ -52,37 +68,57 @@ def compact(window: ContextWindow, cfg) -> Tuple[ContextWindow, List[str]]:  # n
     """
     w = copy.deepcopy(window)
     actions: List[str] = []
+    compact_ratio = cfg.ctx_compact_ratio
+
+    def _still_over() -> bool:
+        return fill_ratio(w, cfg) >= compact_ratio
 
     # 1. 驱逐瞬态 detail_blocks（零损失）
-    if w.detail_blocks:
+    if w.detail_blocks and _still_over():
         w.detail_blocks = []
         actions.append("evict_details")
+        if not _still_over():
+            return w, actions
 
-    # 2. 合并 epoch 摘要（无损：最旧若干条合并为 1 条）
-    if len(w.history) > cfg.ctx_summary_compact_after and cfg.ctx_epoch_merge_n >= 1:
+    # 2. 合并 epoch 摘要（无损：最旧若干条合并为 1 条；仍超则继续扩大合并窗口）
+    while (
+        len(w.history) > max(cfg.ctx_summary_compact_after, 1)
+        and _still_over()
+        and cfg.ctx_epoch_merge_n >= 1
+    ):
         keep = max(cfg.ctx_epoch_merge_n, 1)
+        if len(w.history) <= keep:
+            break
         oldest = w.history[: len(w.history) - keep]
         recent = w.history[len(w.history) - keep :]
-        if oldest:
-            merged = "；".join(oldest)
-            if len(merged) > cfg.ctx_epoch_max_chars:
-                merged = merged[: cfg.ctx_epoch_max_chars] + "…"
-            w.history = [f"[epoch] {merged}"] + recent
-            actions.append("merge_epoch")
+        merged = "；".join(oldest)
+        if len(merged) > cfg.ctx_epoch_max_chars:
+            merged = merged[: cfg.ctx_epoch_max_chars] + "…"
+        w.history = [f"[epoch] {merged}"] + recent
+        actions.append("merge_epoch" if not actions or actions[-1] != "merge_epoch" else "merge_epoch_again")
+        if not _still_over():
+            return w, actions
 
     # 3. 裁剪冷记忆（保留最近 COLD_TRIM_TOP_M）
-    if len(w.cold_memory) > cfg.ctx_cold_trim_top_m:
+    if len(w.cold_memory) > cfg.ctx_cold_trim_top_m and _still_over():
         w.cold_memory = w.cold_memory[-cfg.ctx_cold_trim_top_m :]
         actions.append("trim_cold")
+        if not _still_over():
+            return w, actions
 
-    # 4. 工具 schema 极简
-    if w.tool_schema:
+    # 4. 工具 schema 极简（仅保留占位提示）
+    if w.tool_schema and _still_over():
         w.tool_schema = "<tools: 已启用，按需调用本地工具>"
         actions.append("simplify_tools")
+        if not _still_over():
+            return w, actions
 
-    # 5. HARD：仍超 → 丢弃最旧 epoch
-    if fill_ratio(w, cfg) >= cfg.ctx_hard_ratio and w.history:
+    # 5. HARD：仍超 → 反复丢弃最旧 epoch，直至低于 COMPACT 或历史耗尽
+    while fill_ratio(w, cfg) >= cfg.ctx_hard_ratio and len(w.history) > 1:
         w.history = w.history[1:]
-        actions.append("drop_oldest_epoch")
+        if not actions or actions[-1] != "drop_oldest_epoch":
+            actions.append("drop_oldest_epoch")
+        if fill_ratio(w, cfg) < compact_ratio:
+            break
 
     return w, actions
