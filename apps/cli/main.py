@@ -63,7 +63,11 @@ def _build_engine(args, with_db: bool = True, force_fake: bool = False):
         )
     repo = None
     if with_db and not getattr(args, "no_db", False):
-        conn = get_connection(settings.db_path)
+        # check_same_thread=False：工具执行器（doc/08 executor）在独立线程运行工具，
+        # 而工具（如 recall_memory）会经 ctx.repo/ctx.memory 访问本连接。若为 True，
+        # 每次工具调用都会抛 "SQLite objects created in a thread..."，并被静默吞掉。
+        # 与 apps/api、apps/ui 保持一致。
+        conn = get_connection(settings.db_path, check_same_thread=False)
         migrate(conn, "migrations")
         repo = SQLiteRepo(conn)
     registry = _build_registry(settings)

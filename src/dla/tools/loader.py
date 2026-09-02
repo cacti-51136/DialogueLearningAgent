@@ -53,7 +53,14 @@ def discover_directory(plugins_pkg: Optional[str] = None) -> List[Tuple[Tool, st
                 continue
             for t in _extract_tools(m):
                 out.append((t, name, m))
-        return out
+        # 仅在该候选确实抽出工具时才返回。
+        # 反例（双导入树）：src 与项目根同时在 sys.path 时，``dla.*`` 与 ``src.dla.*``
+        # 是两棵**互不相同**的模块树，各自的 ``Tool`` 类也不同。若本 loader 属于
+        # ``src.dla`` 树，却先命中 ``dla.tools.plugins``，抽出的实例来自另一棵树，
+        # isinstance(t, Tool) 恒为 False → out 为空。此时必须继续尝试下一个候选
+        # （``src.dla.tools.plugins``）才能拿到同树的工具实例。
+        if out:
+            return out
     return []
 
 
