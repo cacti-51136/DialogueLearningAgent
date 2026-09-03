@@ -237,14 +237,14 @@ def test_consume_ops_guardrails(lib, scenario_dir, tmp_path):
     eng.start_session(mode="fixed", scenario_id="oral_practice", sid="G0")
     g0 = eng._sessions["G0"]
     l3_tmpl = list(g0.l3_template_keys)[0]
-    assert eng._consume_ops(g0, [{"op": "delete", "key": l3_tmpl}], Layer.L3) == 0
+    assert eng._consume_ops(g0, [{"op": "delete", "key": l3_tmpl}], Layer.L3) == (0, [])
     assert not repo.recent_lexicon_ops("G0")
 
     # --- auto 模式：模板词为空，专注护栏 ---
     sess = _auto_session(eng, "G1")
 
     # 层归属不匹配：把 L1 词当 L3 操作 → 拒绝
-    n = eng._consume_ops(sess, [{"op": "add", "key": l1_all[0], "intensity": 0.5}], Layer.L3)
+    n, _ = eng._consume_ops(sess, [{"op": "add", "key": l1_all[0], "intensity": 0.5}], Layer.L3)
     assert n == 0
     rows = repo.recent_lexicon_ops("G1")
     assert any(r["applied"] == 0 and "layer_mismatch" in (r["llm_reason"] or "") for r in rows)

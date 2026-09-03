@@ -20,8 +20,10 @@ from ..keywords.lexicon import Lexicon
 _SYSTEM_PROMPT = """你是 DialogueLearningAgent 的分析器。基于用户发言与上一轮 agent 回复，输出 JSON：
 {
   "extractions": [{"key": "受控关键词(必须来自给定词表)", "intensity": 0~1}],
+  "user_predictions": [{"key": "用户肖像词(白名单内)", "intensity": 0~1, "depth": "shallow"}],
   "scene_ops": [],            // auto/free 模式下对 L1 场景关键词的实时增减（可选）
   "agent_ops": [],            // 对场景工作集关键词的增删改建议（可选，带护栏）
+  "satisfaction": null,       // 若用户明确反馈上一轮回复(基于 based_on_turn)，给出 {"score":-1~1,"signal":"","based_on_turn":<轮次>}
   "turn_summary": "≤100字本轮压缩摘要",
   "confidence": 0~1
 }
@@ -31,8 +33,10 @@ _SYSTEM_PROMPT = """你是 DialogueLearningAgent 的分析器。基于用户发�
 @dataclass
 class AnalysisResult:
     extractions: List[dict] = field(default_factory=list)  # 白名单过滤后的 {key,intensity}
+    user_predictions: List[dict] = field(default_factory=list)  # 当前轮浅预测（doc/06 §4.1）
     scene_ops: List[dict] = field(default_factory=list)
     agent_ops: List[dict] = field(default_factory=list)
+    satisfaction: Optional[dict] = None  # {"score","signal","based_on_turn"}（doc/06 §4.3）
     turn_summary: str = ""
     confidence: float = 0.5
     raw_unknown: List[str] = field(default_factory=list)  # 词表外关键词（反哺词库）
@@ -85,10 +89,24 @@ def analyze(
         known.append({"key": canon, "intensity": intensity})
 
     summary = str(data.get("turn_summary", ""))[:100]
+    sat = data.get("satisfaction")
+    if isinstance(sat, dict):
+        try:
+            sat = {
+                "score": float(sat.get("score", 0.0)),
+                "signal": str(sat.get("signal", "")),
+                "based_on_turn": int(sat["based_on_turn"]) if sat.get("based_on_turn") is not None else None,
+            }
+        except (ValueError, TypeError):
+            sat = None
+    else:
+        sat = None
     return AnalysisResult(
         extractions=known,
+        user_predictions=list(data.get("user_predictions", [])),
         scene_ops=list(data.get("scene_ops", [])),
         agent_ops=list(data.get("agent_ops", [])),
+        satisfaction=sat,
         turn_summary=summary,
         confidence=float(data.get("confidence", 0.5)),
         raw_unknown=unknown,

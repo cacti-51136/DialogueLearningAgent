@@ -90,6 +90,7 @@ class Settings:
     analysis_enable_heuristics: bool = True
 
     # ---- 本地向量化与在线学习（doc/06）----
+    lvm_enabled: bool = False  # 默认关闭，避免未训练先验扰动既有权重；训练发生后自动激活
     lvm_dim: int = 64
     lvm_backbone: str = ""  # 留空=随机初始化
     lvm_learning_rate: float = 0.01
@@ -110,6 +111,7 @@ class Settings:
     mode_free_bootstrap_conf: float = 0.6
     mode_free_require_desc: bool = True
     mode_free_bootstrap_model: str = ""  # 留空复用 analyzer_model（可用更便宜模型做 Bootstrap）
+    mode_auto_lock_conf: float = 0.8  # warmup 后场景锁定等效置信度（doc/02 §3.5）
 
     # ---- 对话历史冷热记忆（doc/07）----
     memory_enable: bool = True
@@ -263,6 +265,7 @@ class Settings:
             analysis_period=env("DLA_ANALYSIS__PERIOD", 3, int),
             analysis_enable_heuristics=env("DLA_ANALYSIS__ENABLE_HEURISTICS", True, _as_bool),
             lvm_dim=env("DLA_LVM__DIM", 64, int),
+            lvm_enabled=env("DLA_LVM__ENABLED", False, _as_bool),
             lvm_backbone=env("DLA_LVM__BACKBONE", ""),
             lvm_learning_rate=env("DLA_LVM__LEARNING_RATE", 0.01, float),
             lvm_lr_decay=env("DLA_LVM__LR_DECAY", 0.0, float),
@@ -280,6 +283,7 @@ class Settings:
             mode_free_bootstrap_conf=env("DLA_MODE__FREE_BOOTSTRAP_CONF", 0.6, float),
             mode_free_require_desc=env("DLA_MODE__FREE_REQUIRE_DESC", True, _as_bool),
             mode_free_bootstrap_model=env("DLA_MODE__FREE_BOOTSTRAP_MODEL", ""),
+            mode_auto_lock_conf=env("DLA_MODE__AUTO_LOCK_CONF", 0.8, float),
             memory_enable=env("DLA_MEMORY__ENABLE", True, _as_bool),
             memory_hot_window=env("DLA_MEMORY__HOT_WINDOW", 6, int),
             memory_cold_top_k=env("DLA_MEMORY__COLD_TOP_K", 4, int),

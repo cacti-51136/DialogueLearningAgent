@@ -271,6 +271,106 @@ class SQLiteRepo:
         )
         return [dict(r) for r in cur.fetchall()]
 
+    # ---- LVM（本地向量化模型 / 在线学习，doc/06）----
+    def save_lvm_heads(self, state: dict, embeddings: dict) -> None:
+        """保存 LVM 关系头矩阵 / 偏置 / 步数与冻结嵌入（doc/06 §6.5）。"""
+        cur = self.conn.cursor()
+        dim = int(state.get("dim", 0))
+        for relation, head in state.get("heads", {}).items():
+            cur.execute(
+                "INSERT INTO lvm_relation_heads(relation, dim, matrix_json, bias_json, step) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(relation) DO UPDATE SET dim=excluded.dim, matrix_json=excluded.matrix_json, "
+                "bias_json=excluded.bias_json, step=excluded.step",
+                (relation, dim, json.dumps(head["matrix"], ensure_ascii=False),
+                 json.dumps(head["bias"], ensure_ascii=False), int(state.get("step", 0))),
+            )
+        if embeddings:
+            for keyword, vec in embeddings.items():
+                cur.execute(
+                    "INSERT INTO lvm_embeddings(keyword, dim, vec_json) VALUES(?,?,?) "
+                    "ON CONFLICT(keyword) DO UPDATE SET dim=excluded.dim, vec_json=excluded.vec_json",
+                    (keyword, dim, json.dumps(vec, ensure_ascii=False)),
+                )
+        self.conn.commit()
+
+    def load_lvm_heads(self) -> Optional[dict]:
+        """读取已保存的 LVM 状态（matrix/bias/step），无数据返回 None。"""
+        cur = self.conn.cursor()
+        cur.execute("SELECT relation, dim, matrix_json, bias_json, step FROM lvm_relation_heads")
+        rows = cur.fetchall()
+        if not rows:
+            return None
+        heads = {}
+        dim = 0
+        for r in rows:
+            dim = int(r["dim"])
+            heads[r["relation"]] = {
+                "matrix": json.loads(r["matrix_json"]),
+                "bias": json.loads(r["bias_json"]),
+            }
+            step = int(r["step"])
+        return {"dim": dim, "step": step, "heads": heads}
+
+    def log_training_step(self, step: int, loss: float, lr: float, samples: int, head: str) -> None:
+        """记录一次 LVM 训练步（doc-06 §6.5 可观测）。"""
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO lvm_training_log(step, loss, lr, samples, head, created_at) VALUES(?,?,?,?,?,?)",
+            (step, float(loss), float(lr), int(samples), head, time.time()),
+        )
+        self.conn.commit()
+
+    def recent_training_log(self, limit: int = 20) -> List[dict]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT step, loss, lr, samples, head, created_at FROM lvm_training_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def log_feedback_signal(
+        self,
+        session_id: Optional[str],
+        turn: int,
+        score: float,
+        signal: str = "",
+        based_on_turn: Optional[int] = None,
+        created_at: Optional[float] = None,
+    ) -> None:
+        """记录一条满意度反馈信号（doc-06 §4.3）。"""
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO feedback_signals(session_id, turn, score, signal, based_on_turn, created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (session_id, int(turn), float(score), signal or "", based_on_turn, created_at or time.time()),
+        )
+        self.conn.commit()
+
+    def recent_feedback_signals(self, session_id: Optional[str] = None, limit: int = 50) -> List[dict]:
+        cur = self.conn.cursor()
+        if session_id:
+            cur.execute(
+                "SELECT session_id, turn, score, signal, based_on_turn, created_at "
+                "FROM feedback_signals WHERE session_id=? ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            )
+        else:
+            cur.execute(
+                "SELECT session_id, turn, score, signal, based_on_turn, created_at "
+                "FROM feedback_signals ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+        return [dict(r) for r in cur.fetchall()]
+
+    def lvm_reset(self) -> None:
+        """清空 LVM 全部状态（doc-06 §9：dla lvm reset）。"""
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM lvm_relation_heads")
+        cur.execute("DELETE FROM lvm_embeddings")
+        cur.execute("DELETE FROM lvm_training_log")
+        cur.execute("DELETE FROM feedback_signals")
+        self.conn.commit()
+
     def log_tool_call(self, session_id: str, tool: str, args_json: str = "{}", ok: int = 1, error: str = "", created_at: Optional[float] = None) -> None:
         cur = self.conn.cursor()
         cur.execute(

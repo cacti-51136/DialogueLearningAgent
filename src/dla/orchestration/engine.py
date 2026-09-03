@@ -94,6 +94,9 @@ class _Session:
     l3_template_keys: Set[str] = field(default_factory=set)
     l1_auto_added: Set[str] = field(default_factory=set)
     l3_auto_added: Set[str] = field(default_factory=set)
+    # LVM 双反馈回路（doc/06 §7）：保存上一轮上下文向量与前活跃 L3 集，供满意度后向训练
+    last_q: Optional["object"] = None  # np.ndarray | None
+    last_l3_keys: List[str] = field(default_factory=list)
 
 
 class DialogueEngine:
@@ -118,6 +121,12 @@ class DialogueEngine:
         self._sessions: Dict[str, _Session] = {}
         self._active: Optional[str] = None
 
+        # ---- LVM 本地向量化 / 在线学习（doc/06）----
+        # 懒加载：numpy 缺失时自动降级为 None，不影响核心闭环（lvm_enabled 默认关闭）
+        self.lvm: Optional[object] = None
+        self.learner: Optional[object] = None
+        self._init_lvm()
+
     # ---- 工具 ----
     def _now(self) -> float:
         if self.clock is not None:
@@ -126,6 +135,37 @@ class DialogueEngine:
 
     def _detect_event(self, text: str) -> bool:
         return any(w in text for w in _EVENT_WORDS)
+
+    # ---- LVM 初始化（doc/06）----
+    def _init_lvm(self) -> None:
+        """构建本地向量化模型与在线学习器；lvm_enabled 关闭或 numpy 缺失时置 None 静默降级。"""
+        if not getattr(self.settings, "lvm_enabled", False):
+            return
+        try:
+            from ..keywords.vectorizer import KeywordVectorizer
+            from ..keywords.learning import OnlineLearner
+        except ImportError:
+            return  # 无 numpy 依赖：LVM 不可用，核心闭环不受影响
+        try:
+            v = KeywordVectorizer(self.lib.lexicon, dim=self.settings.lvm_dim)
+            learner = OnlineLearner(v, self.settings, self.repo)
+            # 跨会话持续个性化：恢复已训练的关联矩阵（doc/06 §6.5）
+            if self.repo is not None:
+                try:
+                    state = self.repo.load_lvm_heads()
+                    if state is not None:
+                        v.import_state(state)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.lvm = v
+            self.learner = learner
+        except Exception:  # noqa: BLE001 - LVM 初始化失败绝不阻断主流程
+            self.lvm = None
+            self.learner = None
+
+    @property
+    def _lvm_active(self) -> bool:
+        return self.lvm is not None and self.learner is not None
 
     @staticmethod
     def _l3_distance(a: Dict[str, float], b: Dict[str, float]) -> float:
@@ -464,6 +504,8 @@ class DialogueEngine:
         chain.append(("trigger", {"turn": sess.turn, "do_analyze": do_analyze, "event": force}))
 
         new_candidates: List[str] = []
+        applied_l3_ops: List[dict] = []
+        satisfaction: Optional[dict] = None
         if do_analyze:
             heur = extract_heuristics(user_text, sess.turn, now, self.lib.lexicon)
             for e in heur:
@@ -479,8 +521,10 @@ class DialogueEngine:
                 sess.pending_summary = res.turn_summary
                 # 消费 scene_ops(L1) / agent_ops(L3)（#37：此前被丢弃、白白消耗 token）
                 ops_applied = 0
-                ops_applied += self._consume_ops(sess, res.scene_ops, Layer.L1)
-                ops_applied += self._consume_ops(sess, res.agent_ops, Layer.L3)
+                a1, _ = self._consume_ops(sess, res.scene_ops, Layer.L1)
+                a3, applied_l3_ops = self._consume_ops(sess, res.agent_ops, Layer.L3)
+                ops_applied += a1 + a3
+                satisfaction = res.satisfaction
                 chain.append(("analyze", {"heuristics": len(heur), "llm_extractions": len(res.extractions), "unknown": unknown, "ops_applied": ops_applied}))
             except AnalysisError as e:
                 chain.append(("analyze_error", {"error": str(e)}))  # 降级：沿用旧权重
@@ -488,6 +532,44 @@ class DialogueEngine:
         # 重算三层
         snapshot = sess.engine.compute_all(sess.turn)
         chain.append(("weights", {"l1": snapshot.l1, "l2": snapshot.l2, "l3": snapshot.l3}))
+
+        # ---- auto 模式场景锁定（doc/02 §3.5）：warmup 后把 scene_ops 累积的 L1 升为临时预设，停止漂移 ----
+        self._maybe_stabilize_auto_l1(sess)
+        if sess.l1_locked:
+            snapshot = sess.engine.compute_all(sess.turn)  # 锁定后重算 L1 权重
+
+        # ---- LVM 在线学习（doc/06）：注入 Agent 先验 p_agent + 训练 ----
+        q_t = None
+        if self._lvm_active:
+            # 上下文向量 q_t = Σ L1 w·e + Σ L2 w·e
+            q_t = self.lvm.context_vector(snapshot.l1, snapshot.l2)
+            # 仅在「已训练」后注入先验：未训练时 p_agent 为均匀值会扰动既有权重，故门控避免回归
+            if self.lvm.has_learned():
+                p_agent = self.lvm.agent_prior(q_t, tau=self.settings.lvm_temp)
+                sess.engine.set_p_agent(p_agent)
+                snapshot = sess.engine.compute_all(sess.turn)  # γ 融合进 w3
+                chain.append(("lvm_prior", {
+                    "top": sorted(p_agent.items(), key=lambda kv: -kv[1])[:5],
+                    "has_learned": True,
+                }))
+            # 训练：agent_ops（前向监督）
+            if applied_l3_ops:
+                self.learner.record_agent_ops(q_t, applied_l3_ops)
+            # 训练：satisfaction（后向监督，用上一轮上下文与活跃 L3 集）
+            if satisfaction is not None and sess.last_q is not None:
+                self.learner.record_satisfaction(
+                    sess.sid, sess.turn, sess.last_q, sess.last_l3_keys,
+                    float(satisfaction.get("score", 0.0)),
+                    str(satisfaction.get("signal", "")),
+                    satisfaction.get("based_on_turn"),
+                )
+            if self.learner.replay:
+                losses = self.learner.train(epochs=1)
+                if losses:
+                    chain.append(("lvm_train", {"step": self.lvm.step, "loss": round(float(losses[-1]), 4)}))
+        # 记录本轮上下文与活跃 L3 集，供下一轮满意度后向训练使用
+        sess.last_q = q_t
+        sess.last_l3_keys = list(snapshot.l3.keys())
 
         # 稳定性
         delta = self._l3_distance(sess.last_l3, snapshot.l3)
@@ -787,6 +869,23 @@ class DialogueEngine:
         return spec[: self.settings.persona_spec_max_chars]
 
     # ---- 运行期词库操作消费（doc/06 §4.2/§4.4 / #37）----
+    def _maybe_stabilize_auto_l1(self, sess: _Session) -> None:
+        """auto 模式 warmup 后锁定 L1（doc/02 §3.5）。
+
+        把 ``scene_ops`` 累积的 auto_added 场景词升到 ``mode_auto_lock_conf`` 等效置信度并置
+        ``l1_locked``，使其"视为该会话的临时预设，后续不再随意漂移"。固定/free 模式不触发。
+        """
+        if sess.mode != "auto" or sess.l1_locked:
+            return
+        if sess.turn < self.settings.mode_auto_warmup_turns:
+            return
+        if not sess.l1_auto_added:
+            return
+        lock_conf = float(self.settings.mode_auto_lock_conf)
+        for k in sess.l1_auto_added:
+            sess.engine.set_src_conf(k, lock_conf)
+        sess.l1_locked = True
+
     def _consume_ops(self, sess: _Session, ops: list, target_layer: Layer) -> int:
         """消费分析器产出的 scene_ops(L1) 或 agent_ops(L3)，带护栏并审计落库。
 
@@ -799,12 +898,13 @@ class DialogueEngine:
         - delete：仅可删 auto_added（运行期新增）词，模板基础词受保护。
         """
         if not ops:
-            return 0
+            return 0, []
         if sess.mode == "fixed":
-            return 0  # 固定模式：场景与人格均锁定，任何运行期增删改都不生效
+            return 0, []  # 固定模式：场景与人格均锁定，任何运行期增删改都不生效
         eng = sess.engine
         lex = self.lib.lexicon
         applied = 0
+        applied_ops: List[dict] = []
         for op in ops:
             if not isinstance(op, dict):
                 continue
@@ -818,6 +918,7 @@ class DialogueEngine:
                 self._log_op(sess, op_type or "unknown", target_layer.value, canon, payload,
                              op.get("reason", ""), applied=False, reject_reason="unknown_op")
                 continue
+            op["_applied"] = False  # 用于 LVM 训练：仅取生效的操作
 
             # 层归属校验
             if kw is not None and kw.layer != target_layer:
@@ -848,11 +949,15 @@ class DialogueEngine:
                 else:
                     eng.add_l3_key(canon, intensity)
                     auto_added.add(canon)
-                # ops 为 LLM 推断，映射 doc/02 §3.2 inferred=0.50
-                eng.set_src_conf(canon, 0.5)
+                # ops 为 LLM 推断：映射 doc/02 §3.2 inferred=0.50；已锁定的 auto 场景词升到锁定置信度
+                conf = (self.settings.mode_auto_lock_conf
+                        if (target_layer == Layer.L1 and sess.l1_locked) else 0.5)
+                eng.set_src_conf(canon, conf)
                 self._log_op(sess, "add", target_layer.value, canon, payload,
                              op.get("reason", ""), applied=True)
+                op["_applied"] = True
                 applied += 1
+                applied_ops.append(op)
 
             elif op_type == "update":
                 delta = float(op.get("delta", 0.0))
@@ -868,7 +973,9 @@ class DialogueEngine:
                 if ok:
                     self._log_op(sess, "update", target_layer.value, canon, payload,
                                  op.get("reason", ""), applied=True)
+                    op["_applied"] = True
                     applied += 1
+                    applied_ops.append(op)
                 else:
                     self._log_op(sess, "update", target_layer.value, canon, payload,
                                  op.get("reason", ""), applied=False, reject_reason="update_failed")
@@ -890,9 +997,11 @@ class DialogueEngine:
                     auto_added.discard(canon)
                 self._log_op(sess, "delete", target_layer.value, canon, payload,
                              op.get("reason", ""), applied=True)
+                op["_applied"] = True
                 applied += 1
+                applied_ops.append(op)
 
-        return applied
+        return applied, applied_ops
 
     def _log_op(self, sess: _Session, op_type: str, layer: str, target_key, payload: str,
                 llm_reason: str, *, applied: bool, reject_reason: str = "") -> None:

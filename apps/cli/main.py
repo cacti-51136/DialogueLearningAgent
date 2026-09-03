@@ -303,6 +303,55 @@ def cmd_ops(args) -> int:
     print("未知 ops 子命令"); return 2
 
 
+# ----------------------------- lvm -----------------------------
+def cmd_lvm(args) -> int:
+    """本地向量化模型 / 在线学习运维（doc/06）。
+
+    - reset  ：一键复位关联矩阵到 α·I、清空训练日志与反馈信号（doc/06 §9）。
+    - status ：展示关系头步数 / 最近训练损失 / 反馈信号概览。
+    - feedback：列出已记录的满意度反馈信号。
+    """
+    settings = get_settings()
+    conn = get_connection(settings.db_path)
+    migrate(conn, "migrations")
+    repo = SQLiteRepo(conn)
+    if args.sub == "reset":
+        repo.lvm_reset()
+        print("LVM 已复位（关联矩阵→α·I，训练日志/反馈信号已清空）")
+        return 0
+    if args.sub == "status":
+        state = repo.load_lvm_heads()
+        if state is None:
+            print("LVM 尚未训练（无关系头状态）")
+        else:
+            print(f"关系头步数 step={state.get('step')}  dim={state.get('dim')}")
+            print("关系头：", ", ".join(state.get("heads", {}).keys()) or "（空）")
+        logs = repo.recent_training_log(5)
+        if logs:
+            print("最近训练步：")
+            for r in logs:
+                print(f"  step={r['step']} loss={r['loss']:.4f} lr={r['lr']} samples={r['samples']} head={r['head']}")
+        else:
+            print("（暂无训练日志）")
+        fb = repo.recent_feedback_signals(limit=5)
+        if fb:
+            print("最近反馈信号：")
+            for r in fb:
+                print(f"  {r['session_id']} turn={r['turn']} score={r['score']}")
+        return 0
+    if args.sub == "feedback":
+        sid = getattr(args, "session", None)
+        limit = int(getattr(args, "limit", 20) or 20)
+        rows = repo.recent_feedback_signals(sid, limit)
+        if not rows:
+            print("（暂无满意度反馈信号）")
+            return 0
+        for r in rows:
+            print(f"{r['session_id']} turn={r['turn']} score={r['score']} based_on={r['based_on_turn']} signal={r['signal'] or ''}")
+        return 0
+    print("未知 lvm 子命令"); return 2
+
+
 # ----------------------------- tool -----------------------------
 def cmd_tool(args) -> int:
     settings = get_settings()
@@ -438,6 +487,14 @@ def build_parser() -> argparse.ArgumentParser:
     pol.add_argument("--session", default=None, help="限定会话 id（缺省列出全部会话）")
     pol.add_argument("--limit", type=int, default=20, help="最多展示条数")
 
+    pl = sub.add_parser("lvm", help="本地向量化模型 / 在线学习（doc/06）")
+    pls = pl.add_subparsers(dest="sub")
+    pls.add_parser("reset")
+    pls.add_parser("status")
+    plf = pls.add_parser("feedback")
+    plf.add_argument("--session", default=None)
+    plf.add_argument("--limit", type=int, default=20)
+
     pb = sub.add_parser("bench", help="离线剧本回归")
     pb.add_argument("--no-db", action="store_true")
 
@@ -459,6 +516,8 @@ def main(argv: Optional[list] = None) -> int:
         return cmd_tool(args)
     if args.cmd == "ops":
         return cmd_ops(args)
+    if args.cmd == "lvm":
+        return cmd_lvm(args)
     if args.cmd == "bench":
         return cmd_bench(args)
     parser.print_help()

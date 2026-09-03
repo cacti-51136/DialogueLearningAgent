@@ -244,8 +244,10 @@ class FakeLLMClient:
         summary = (user_part[:90] + "…") if len(user_part) > 90 else user_part
         result = {
             "extractions": extractions,
+            "user_predictions": [],
             "scene_ops": [],
             "agent_ops": [],
+            "satisfaction": None,
             "turn_summary": f"用户表达了相关情绪/态度：{summary}" if extractions else f"用户：{summary}",
             "confidence": 0.7 if extractions else 0.5,
         }
