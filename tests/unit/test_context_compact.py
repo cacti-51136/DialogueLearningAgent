@@ -11,7 +11,9 @@ from dla.prompt.context_compact import (
     ContextWindow,
     compact,
     fill_ratio,
+    trigger_level_of,
     window_parts,
+    window_tokens,
 )
 
 
@@ -61,6 +63,27 @@ def test_fill_ratio_formula():
     win = _win(system="a" * 800)  # 800 非中文 char → ceil(800/4)=200 tokens
     # 估算 200 / 800 = 0.25
     assert abs(fill_ratio(win, cfg) - 0.25) < 0.02
+
+
+def test_window_tokens_matches_fill_ratio_numerator():
+    """window_tokens 与 fill_ratio 必须同口径（doc/11 §8.1 可观测字段自洽）。"""
+    cfg = _cfg(ctx_max_tokens=1000, ctx_reserve=0.20)  # budget_in = 800
+    win = _win(system="核心", history=["h1", "h2"], cold=["c1"], detail=["d1"], tool="t", current="问")
+    total = window_tokens(win)
+    assert total == sum(window_parts(win, cfg).values())
+    # 恒等式：window_tokens / budget == fill_ratio
+    assert abs(total / 800 - fill_ratio(win, cfg)) < 1e-9
+
+
+def test_trigger_level_of_staged_thresholds():
+    cfg = _cfg(ctx_warn_ratio=0.70, ctx_compact_ratio=0.85, ctx_hard_ratio=0.95)
+    assert trigger_level_of(0.50, cfg) == "NONE"
+    assert trigger_level_of(0.70, cfg) == "WARN"      # 下边界含入
+    assert trigger_level_of(0.84, cfg) == "WARN"
+    assert trigger_level_of(0.85, cfg) == "COMPACT"
+    assert trigger_level_of(0.94, cfg) == "COMPACT"
+    assert trigger_level_of(0.95, cfg) == "HARD"
+    assert trigger_level_of(1.50, cfg) == "HARD"
 
 
 def test_window_parts_sum_equals_fill_numerator():

@@ -50,6 +50,9 @@ class WeightEngine:
         self._baseline_l3: Dict[str, float] = {}
         self._w3_llm: Dict[str, float] = {}  # 可选 LLM 精炼结果
         self._p_agent: Dict[str, float] = {}  # 可选 LVM 学习先验
+        # 来源置信度（doc/02 §3.2：w = w_base × src_confidence × salience）
+        # 缺省 1.0 = 不打折，保证既有路径（场景模板 preset 等）数值完全不变。
+        self._src_conf: Dict[str, float] = {}
 
     # ---- 时钟 ----
     def _now(self) -> float:
@@ -80,6 +83,60 @@ class WeightEngine:
         """注入一个预设强度（如 free 模式 L2 弱种子）。"""
         self._preset[key] = max(0.0, min(1.0, intensity))
 
+    def set_src_conf(self, key: str, src_confidence: float) -> None:
+        """设置来源置信度（doc/02 §3.2）。
+
+        ``w(k) = w_base(k) × src_confidence(source) × salience(k)``。
+        取值：user_explicit 1.00 / preset 0.80 / bootstrap 0.60 / inferred 0.50。
+
+        注意：缺省为 1.0（不打折），故**仅对显式设置的关键词生效**——
+        这样引入本机制不会改变既有场景模板路径的任何数值。
+        """
+        self._src_conf[key] = max(0.0, min(1.0, float(src_confidence)))
+
+    def src_conf(self, key: str) -> float:
+        """读取来源置信度（缺省 1.0）。"""
+        return self._src_conf.get(key, 1.0)
+
+    # ---- 运行期工作集增删改（doc/06 §4.2/§4.4：scene_ops L1 / agent_ops L3）----
+    # 这些方法是纯机械的「写工作集」，护栏（delta 上限 / 模板词保护 / 词表校验）
+    # 在 orchestration 层 _consume_ops 中统一裁决，这里只负责把已裁决的结果落进引擎。
+    def add_l1_key(self, key: str, intensity: float = 0.6) -> None:
+        """新增一个 L1 场景词到活跃工作集（scene_ops add）。"""
+        self._active_l1.add(key)
+        self._preset[key] = max(0.0, min(1.0, float(intensity)))
+
+    def update_l1_key(self, key: str, delta: float) -> bool:
+        """调整 L1 场景词强度（scene_ops update）。不在工作集返回 False。"""
+        if key not in self._active_l1:
+            return False
+        self._preset[key] = max(0.0, min(1.0, self._preset.get(key, 0.0) + float(delta)))
+        return True
+
+    def remove_l1_key(self, key: str) -> None:
+        """从 L1 活跃工作集移除（scene_ops delete，仅 auto_added）。"""
+        self._active_l1.discard(key)
+        self._preset.pop(key, None)
+
+    def add_l3_key(self, key: str, intensity: float = 0.6) -> None:
+        """新增一个 L3 工作集词（agent_ops add，仅非新维度已收编词）。"""
+        self._baseline_l3[key] = max(0.0, min(1.0, float(intensity)))
+
+    def update_l3_key(self, key: str, delta: float) -> bool:
+        """调整 L3 工作集词强度（agent_ops update）。不在工作集返回 False。"""
+        if key not in self._baseline_l3:
+            return False
+        self._baseline_l3[key] = max(0.0, min(1.0, self._baseline_l3[key] + float(delta)))
+        return True
+
+    def remove_l3_key(self, key: str) -> None:
+        """从 L3 工作集移除（agent_ops delete，仅 auto_added）。"""
+        self._baseline_l3.pop(key, None)
+
+    def l3_working_keys(self) -> Set[str]:
+        """当前 L3 工作集（模板基线 + 运行期新增）。"""
+        return set(self._baseline_l3.keys())
+
     def add_evidence(self, ev: Evidence) -> None:
         """追加一条观测证据（来自 heuristics / llm_analyzer）。"""
         self._obs[ev.key].append(ev)
@@ -103,7 +160,8 @@ class WeightEngine:
         return obs + pre
 
     def _weight_of(self, key: str) -> float:
-        return confidence(self._e_total(key), self.cfg.prior_strength)
+        # doc/02 §3.2：w = w_base × src_confidence × salience（salience 缺省 1.0）
+        return confidence(self._e_total(key), self.cfg.prior_strength) * self._src_conf.get(key, 1.0)
 
     # ---- 三层计算 ----
     def compute_l1(self) -> Dict[str, float]:

@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS persona_changes (
     created_at  REAL NOT NULL
 );
 
+-- 注：本表的**最终结构以 005 为准**。此处仅为历史定义（缺 trigger_level / tokens_*），
+-- 005 会以重建表方式补齐可观测字段（doc/11 §8.1）。请勿在本文件中改这张表——
+-- 001 对既有库不会再执行，改了也无效。
 CREATE TABLE IF NOT EXISTS context_compact_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  TEXT NOT NULL,

@@ -19,8 +19,9 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
+from ..analysis.bootstrap import bootstrap, should_degrade_to_auto
 from ..analysis.heuristics import detect_repetition, extract_heuristics
 from ..analysis.llm_analyzer import AnalysisError, analyze
 from ..analysis.trigger import AnalysisTrigger
@@ -43,7 +44,14 @@ from ..memory.store import ColdMemoryItem
 from ..tools.executor import run_tool
 from ..tools.protocol import ToolContext, ToolResult, validate_args as _validate_tool_args
 from ..prompt.assembler import PromptAssembler
-from ..prompt.context_compact import ContextWindow, compact, fill_ratio, window_parts
+from ..prompt.context_compact import (
+    ContextWindow,
+    compact,
+    fill_ratio,
+    trigger_level_of,
+    window_parts,
+    window_tokens,
+)
 from ..prompt.budget import estimate_tokens
 from ..weighting.coupling import apply_rules
 from ..weighting.engine import WeightEngine, WeightEngineConfig
@@ -76,6 +84,16 @@ class _Session:
     persona_last_turn: int = -999
     persona_drift: float = 0.0
     candidates: CandidateRegistry = field(default_factory=CandidateRegistry)
+    # free 模式 Bootstrap（doc/02 §3.6）
+    bootstrap_seeds: Optional[object] = None   # BootstrapSeeds | None
+    bootstrap_notes: List[str] = field(default_factory=list)
+    # L1 场景锁定（doc/02 §3.5）：scene_ops 建立到稳定后不再随意漂移
+    l1_locked: bool = False
+    # 运行期词库操作工作集追踪（doc/06 §4.2/§4.4 护栏）：模板词受保护、仅可删 auto_added
+    l1_template_keys: Set[str] = field(default_factory=set)
+    l3_template_keys: Set[str] = field(default_factory=set)
+    l1_auto_added: Set[str] = field(default_factory=set)
+    l3_auto_added: Set[str] = field(default_factory=set)
 
 
 class DialogueEngine:
@@ -245,16 +263,65 @@ class DialogueEngine:
             ),
             self.clock,
         )
-        eng.set_l1_scene(dict(sc.l1))
-        for k, v in sc.l2_preset.items():
-            if self.lib.lexicon.normalize(k):
-                eng.set_preset(k, v)
-        eng.set_l3_baseline(dict(sc.l3_baseline))
+        # ---- 模式解析（doc/02 §3.5 auto / §3.6 free）----
+        # 历史缺陷：mode 此前只被存进 _Session，**全代码零读取**，三种模式行为完全一致。
+        eff_mode = mode
+        boot_notes: List[str] = []
+        if should_degrade_to_auto(mode, describe, self.settings.mode_free_require_desc):
+            eff_mode = "auto"
+            boot_notes.append("free 模式缺少场景描述且 FREE_REQUIRE_DESC=true → 降级为 auto")
+
+        seeds = None
+        if eff_mode == "fixed":
+            # 加载场景模板三层（既有行为）
+            eng.set_l1_scene(dict(sc.l1))
+            for k, v in sc.l2_preset.items():
+                if self.lib.lexicon.normalize(k):
+                    eng.set_preset(k, v)
+            eng.set_l3_baseline(dict(sc.l3_baseline))
+        elif eff_mode == "free":
+            seeds = self._bootstrap_seeds(describe, eng, boot_notes)
+            if seeds is None:
+                eff_mode = "auto"  # Bootstrap 失败 → 静默降级为 auto（doc/02 §3.6）
+        # auto：不加载模板三层，L1 留空由 scene_ops 在对话中建立
+
+        # 模板工作集（受保护，agent_ops/scene_ops 的 delete 不可动，update 仅可微调）
+        l1_tpl: Set[str] = set()
+        l3_tpl: Set[str] = set()
+        if eff_mode == "fixed":
+            l1_tpl = set(sc.l1.keys())
+            l3_tpl = set(sc.l3_baseline.keys())
+        elif eff_mode == "free" and seeds is not None:
+            l1_tpl = set(seeds.l1.keys())
+            l3_tpl = set(seeds.l3.keys())
+        # auto：模板三层为空，工作集由 scene_ops 在对话中逐步建立
+
+        if eff_mode == "auto":
+            scene_name = ""
+            greeting = self._pick_fallback_greeting()
+        elif eff_mode == "free" and seeds is not None:
+            scene_name = self._bootstrap_scene_name(describe, sc)
+            greeting = self._generate_greeting(describe, seeds)
+            # L3 种子作 w3_base 一次性写入（doc/02 §3.6：等同加载一个隐式场景模板基线）
+            eng.set_l3_baseline(dict(seeds.l3))
+        else:
+            scene_name = sc.name
+            greeting = sc.greeting
 
         sess = _Session(
-            sid=sid, engine=eng, mode=mode,
-            scene_name=sc.name, safe_mode=sc.safe_mode, greeting=sc.greeting,
+            sid=sid, engine=eng, mode=eff_mode,
+            scene_name=scene_name,
+            # safe_mode 是 doc/09 §6 否决级硬约束，**任何模式都继承**，不可因无预设模板而丢失
+            safe_mode=sc.safe_mode,
+            greeting=greeting,
+            # 模板工作集（受保护：scene_ops/agent_ops 的 delete 不可动，update 仅可微调）
+            l1_template_keys=l1_tpl,
+            l3_template_keys=l3_tpl,
         )
+        if boot_notes:
+            sess.bootstrap_notes = boot_notes
+        if seeds is not None:
+            sess.bootstrap_seeds = seeds
         baseline_snap = eng.compute_all(0)
         sess.last_l3 = dict(baseline_snap.l3)
         sess.baseline_spec = self._derive_baseline_spec(baseline_snap, sess)
@@ -272,6 +339,85 @@ class DialogueEngine:
         self._sessions[sid] = sess
         self._active = sid
         return sess.greeting
+
+    # ---- 自由模式 Bootstrap（doc/02 §3.6 / 决策 D26）----
+    def _bootstrap_seeds(self, describe: Optional[str], eng, notes: List[str]):
+        """调用 LLM 由场景描述生成三层种子并注入引擎。失败返回 None（由调用方降级）。
+
+        ``describe`` 参数此前被 ``start_session`` **完全忽略**，free 模式因此从未生效。
+        """
+        try:
+            seeds = bootstrap(
+                self.llm, describe or "", self.lib.lexicon,
+                model=self.settings.bootstrap_model or None,
+            )
+        except AnalysisError as e:
+            notes.append(f"Bootstrap 失败，降级为 auto：{e}")
+            return None
+        except Exception as e:  # noqa: BLE001 - LLM 不可用时静默降级，绝不阻塞会话
+            notes.append(f"Bootstrap 异常，降级为 auto：{e}")
+            return None
+
+        conf = float(self.settings.mode_free_bootstrap_conf)
+
+        # L1 播种：进入活跃场景集，src_confidence = bootstrap（默认 0.60）
+        if seeds.l1:
+            eng.set_l1_scene(dict(seeds.l1))
+            for k in seeds.l1:
+                eng.set_src_conf(k, conf)
+        # L2 播种：弱种子作冷启动锚（user_temper./user_mood. 已在护栏层丢弃）
+        for k, v in seeds.l2.items():
+            eng.set_preset(k, v)
+            eng.set_src_conf(k, conf)
+        # L3 由调用方写入 baseline（w3_base）；此处不缩放，等同隐式场景模板基线
+
+        if seeds.rejected:
+            notes.append(f"Bootstrap 丢弃 {len(seeds.rejected)} 项（白名单/层归属/禁词护栏）")
+        if not seeds.total:
+            notes.append("Bootstrap 未产出任何合法种子")
+        return seeds
+
+    def _bootstrap_scene_name(self, describe: Optional[str], sc) -> str:
+        """free 模式无预设模板，场景名直接取自描述摘要（供 Prompt 展示用）。"""
+        text = (describe or "").strip().replace("\n", " ")
+        short = text[:24] + ("…" if len(text) > 24 else "")
+        return f"自由场景·{short}" if short else sc.name
+
+    def _pick_fallback_greeting(self) -> str:
+        """兜底称呼（doc/02 §12）：auto 模式 L1 为空时使用。"""
+        try:
+            pool = self.settings.greeting_fallback_list
+        except Exception:  # noqa: BLE001
+            pool = ["你好"]
+        return pool[0] if pool else "你好"
+
+    def _generate_greeting(self, describe: Optional[str], seeds) -> str:
+        """由场景描述 + Bootstrap 种子生成贴合场景的开场称呼（doc/02 §12）。
+
+        失败静默降级到兜底池（D12），绝不阻塞对话。
+        """
+        if not self.settings.greeting_enable:
+            return self._pick_fallback_greeting()
+        keys = list(seeds.l1)[:8] + list(seeds.l3)[:5]
+        hint = "、".join(keys) if keys else "（无）"
+        messages = [
+            ChatMessage(role="system", content=(
+                "你是开场称呼生成器。根据场景描述与已播种的关键词，"
+                "生成一句简洁、贴合场景的中文开场欢迎语。只输出这一句话，不要解释、不要加引号。"
+            )),
+            ChatMessage(role="user", content=f"场景描述：{describe}\n已播种关键词：{hint}"),
+        ]
+        try:
+            resp = self.llm.complete(
+                messages, temperature=0.7,
+                **({"model": self.settings.bootstrap_model} if self.settings.bootstrap_model else {}),
+            )
+            text = (resp.content or "").strip().strip("\"'")
+            if text:
+                return text[:120]
+        except Exception:  # noqa: BLE001 - 与 D12 一致：静默降级
+            pass
+        return self._pick_fallback_greeting()
 
     def switch_session(self, sid: str) -> None:
         """切换到已有会话（不重建，沿用内存缓存或仅恢复历史摘要）。"""
@@ -331,7 +477,11 @@ class DialogueEngine:
                 known, unknown = discover_from_extractions(res.extractions, self.lib.lexicon, sess.candidates)
                 new_candidates = unknown
                 sess.pending_summary = res.turn_summary
-                chain.append(("analyze", {"heuristics": len(heur), "llm_extractions": len(res.extractions), "unknown": unknown}))
+                # 消费 scene_ops(L1) / agent_ops(L3)（#37：此前被丢弃、白白消耗 token）
+                ops_applied = 0
+                ops_applied += self._consume_ops(sess, res.scene_ops, Layer.L1)
+                ops_applied += self._consume_ops(sess, res.agent_ops, Layer.L3)
+                chain.append(("analyze", {"heuristics": len(heur), "llm_extractions": len(res.extractions), "unknown": unknown, "ops_applied": ops_applied}))
             except AnalysisError as e:
                 chain.append(("analyze_error", {"error": str(e)}))  # 降级：沿用旧权重
 
@@ -384,7 +534,12 @@ class DialogueEngine:
             ratio_after = fill_ratio(new_window, self.settings)
             if self.repo is not None:
                 try:
-                    self.repo.log_compact(sess.sid, sess.turn, ratio, ratio_after, actions)
+                    self.repo.log_compact(
+                        sess.sid, sess.turn, ratio, ratio_after, actions,
+                        trigger_level=trigger_level_of(ratio, self.settings),
+                        tokens_before=window_tokens(window),
+                        tokens_after=window_tokens(new_window),
+                    )
                 except Exception:  # noqa: BLE001 - 日志失败不影响主流程
                     pass
             chain.append(("budget_guard", {
@@ -631,6 +786,128 @@ class DialogueEngine:
         spec = f"人格（第{sess.turn}轮）：" + "；".join(parts)
         return spec[: self.settings.persona_spec_max_chars]
 
+    # ---- 运行期词库操作消费（doc/06 §4.2/§4.4 / #37）----
+    def _consume_ops(self, sess: _Session, ops: list, target_layer: Layer) -> int:
+        """消费分析器产出的 scene_ops(L1) 或 agent_ops(L3)，带护栏并审计落库。
+
+        返回本次**成功生效**的操作数。固定模式跳过（场景/人格锁定）。
+
+        护栏（任一违例 → applied=0，记录原因）：
+        - op 类型非法 / 词表外（非新维度才自动收编，新维度走审核不自动收编）→ 拒绝；
+        - 层归属不匹配 → 拒绝；
+        - update：``|delta| ≤ 0.4``，且目标须在当前运行期工作集内；
+        - delete：仅可删 auto_added（运行期新增）词，模板基础词受保护。
+        """
+        if not ops:
+            return 0
+        if sess.mode == "fixed":
+            return 0  # 固定模式：场景与人格均锁定，任何运行期增删改都不生效
+        eng = sess.engine
+        lex = self.lib.lexicon
+        applied = 0
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            op_type = str(op.get("op") or "").lower()
+            key = op.get("key")
+            canon = lex.normalize(key) if key else None
+            kw = lex.get(canon) if canon else None
+            payload = json.dumps(op, ensure_ascii=False)
+
+            if op_type not in ("add", "update", "delete"):
+                self._log_op(sess, op_type or "unknown", target_layer.value, canon, payload,
+                             op.get("reason", ""), applied=False, reject_reason="unknown_op")
+                continue
+
+            # 层归属校验
+            if kw is not None and kw.layer != target_layer:
+                self._log_op(sess, op_type, target_layer.value, canon, payload,
+                             op.get("reason", ""), applied=False, reject_reason="layer_mismatch")
+                continue
+
+            # 词表外 → 走审核流程，不自动收编（doc/06 §4.2/§4.4：新维度不自动收编）
+            if canon is None:
+                self._log_op(sess, op_type, target_layer.value, None, payload,
+                             op.get("reason", ""), applied=False, reject_reason="out_of_lexicon_review")
+                continue
+
+            if target_layer == Layer.L1:
+                working_set = eng.active_l1()
+                tpl = sess.l1_template_keys
+                auto_added = sess.l1_auto_added
+            else:
+                working_set = eng.l3_working_keys()
+                tpl = sess.l3_template_keys
+                auto_added = sess.l3_auto_added
+
+            if op_type == "add":
+                intensity = max(0.0, min(1.0, float(op.get("intensity", 0.6))))
+                if target_layer == Layer.L1:
+                    eng.add_l1_key(canon, intensity)
+                    auto_added.add(canon)
+                else:
+                    eng.add_l3_key(canon, intensity)
+                    auto_added.add(canon)
+                # ops 为 LLM 推断，映射 doc/02 §3.2 inferred=0.50
+                eng.set_src_conf(canon, 0.5)
+                self._log_op(sess, "add", target_layer.value, canon, payload,
+                             op.get("reason", ""), applied=True)
+                applied += 1
+
+            elif op_type == "update":
+                delta = float(op.get("delta", 0.0))
+                if abs(delta) > 0.4:
+                    self._log_op(sess, "update", target_layer.value, canon, payload,
+                                 op.get("reason", ""), applied=False, reject_reason="delta_exceed_limit")
+                    continue
+                if canon not in working_set:
+                    self._log_op(sess, "update", target_layer.value, canon, payload,
+                                 op.get("reason", ""), applied=False, reject_reason="not_in_working_set")
+                    continue
+                ok = eng.update_l1_key(canon, delta) if target_layer == Layer.L1 else eng.update_l3_key(canon, delta)
+                if ok:
+                    self._log_op(sess, "update", target_layer.value, canon, payload,
+                                 op.get("reason", ""), applied=True)
+                    applied += 1
+                else:
+                    self._log_op(sess, "update", target_layer.value, canon, payload,
+                                 op.get("reason", ""), applied=False, reject_reason="update_failed")
+
+            else:  # delete
+                if canon in tpl:
+                    self._log_op(sess, "delete", target_layer.value, canon, payload,
+                                 op.get("reason", ""), applied=False, reject_reason="protected_template_key")
+                    continue
+                if canon not in auto_added:
+                    self._log_op(sess, "delete", target_layer.value, canon, payload,
+                                 op.get("reason", ""), applied=False, reject_reason="not_auto_added")
+                    continue
+                if target_layer == Layer.L1:
+                    eng.remove_l1_key(canon)
+                    auto_added.discard(canon)
+                else:
+                    eng.remove_l3_key(canon)
+                    auto_added.discard(canon)
+                self._log_op(sess, "delete", target_layer.value, canon, payload,
+                             op.get("reason", ""), applied=True)
+                applied += 1
+
+        return applied
+
+    def _log_op(self, sess: _Session, op_type: str, layer: str, target_key, payload: str,
+                llm_reason: str, *, applied: bool, reject_reason: str = "") -> None:
+        """落一条词库操作审计（doc/03 §2.12）。审计失败不影响主流程。"""
+        if self.repo is None:
+            return
+        reason = llm_reason or (f"rejected:{reject_reason}" if not applied else "")
+        try:
+            self.repo.log_lexicon_op(
+                sess.sid, sess.turn, op_type, layer, target_key, payload, reason,
+                1 if applied else 0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---- kw_agent_map 涌现（doc/03 §2.15）----
     def _update_kwmap(self, sess: _Session, snapshot: WeightSnapshot) -> None:
         if self.repo is None:
@@ -783,7 +1060,12 @@ class DialogueEngine:
         ratio_after = fill_ratio(new_window, self.settings)
         if self.repo is not None:
             try:
-                self.repo.log_compact(sess.sid, sess.turn, ratio_before, ratio_after, actions)
+                self.repo.log_compact(
+                    sess.sid, sess.turn, ratio_before, ratio_after, actions,
+                    trigger_level="MANUAL",  # CLI `dla ctx compact --force` 显式触发
+                    tokens_before=window_tokens(window),
+                    tokens_after=window_tokens(new_window),
+                )
             except Exception:  # noqa: BLE001
                 pass
         return {"triggered": True, "ratio_before": ratio_before, "ratio_after": ratio_after, "actions": actions}

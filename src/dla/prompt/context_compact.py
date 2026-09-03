@@ -31,13 +31,13 @@ class ContextWindow:
     current_user_msg: str = ""
 
 
-def fill_ratio(window: ContextWindow, cfg) -> float:
-    """估算整窗 token 占比（doc/11 §3）。
+def window_tokens(window: ContextWindow) -> int:
+    """整窗 token 估算绝对值（doc/11 §8.1 可观测字段 tokens_before/tokens_after）。
 
-    ``system_prompt`` 此处只含**核心段**（角色/用户肖像/交流风格），历史/冷记忆/细节/工具
-    schema 为独立字段，各计一次，避免与已嵌进 system_prompt 的内容重复计数。
+    与 :func:`fill_ratio` 使用完全相同的口径，保证
+    ``window_tokens(w) / budget == fill_ratio(w, cfg)`` 恒成立。
     """
-    total_tokens = (
+    return (
         estimate_tokens(window.system_prompt)
         + estimate_tokens("\n".join(window.history))
         + estimate_tokens("\n".join(window.cold_memory))
@@ -45,8 +45,16 @@ def fill_ratio(window: ContextWindow, cfg) -> float:
         + estimate_tokens(window.tool_schema)
         + estimate_tokens(window.current_user_msg)
     )
+
+
+def fill_ratio(window: ContextWindow, cfg) -> float:
+    """估算整窗 token 占比（doc/11 §3）。
+
+    ``system_prompt`` 此处只含**核心段**（角色/用户肖像/交流风格），历史/冷记忆/细节/工具
+    schema 为独立字段，各计一次，避免与已嵌进 system_prompt 的内容重复计数。
+    """
     budget = max(1, int(cfg.ctx_max_tokens * (1.0 - cfg.ctx_reserve)))
-    return total_tokens / budget
+    return window_tokens(window) / budget
 
 
 def window_parts(window: ContextWindow, cfg) -> dict:
@@ -59,6 +67,21 @@ def window_parts(window: ContextWindow, cfg) -> dict:
         "tool": estimate_tokens(window.tool_schema),
         "current": estimate_tokens(window.current_user_msg),
     }
+
+
+def trigger_level_of(ratio: float, cfg) -> str:
+    """按整窗占比判定触发档位（doc/11 §8.1 trigger_level 可观测字段）。
+
+    阶梯：``>= hard`` → HARD；``>= compact`` → COMPACT；``>= warn`` → WARN；否则 NONE。
+    手动触发（CLI ``--force``）由调用方直接传 ``MANUAL``。
+    """
+    if ratio >= getattr(cfg, "ctx_hard_ratio", 0.95):
+        return "HARD"
+    if ratio >= getattr(cfg, "ctx_compact_ratio", 0.85):
+        return "COMPACT"
+    if ratio >= getattr(cfg, "ctx_warn_ratio", 0.70):
+        return "WARN"
+    return "NONE"
 
 
 def compact(window: ContextWindow, cfg) -> Tuple[ContextWindow, List[str]]:  # noqa: C901

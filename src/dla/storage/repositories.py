@@ -94,13 +94,62 @@ class SQLiteRepo:
         return [dict(r) for r in cur.fetchall()]
 
     # ---- context compact log (doc/11) ----
-    def log_compact(self, session_id: str, turn: int, ratio_before: float, ratio_after: float, actions: list, created_at: Optional[float] = None) -> None:
+    def log_compact(
+        self,
+        session_id: str,
+        turn: int,
+        ratio_before: float,
+        ratio_after: float,
+        actions: list,
+        created_at: Optional[float] = None,
+        *,
+        trigger_level: str = "COMPACT",
+        tokens_before: int = 0,
+        tokens_after: int = 0,
+    ) -> None:
+        """记录一次上下文压缩（doc/11 §8.1 可观测）。
+
+        新增的三个字段（trigger_level / tokens_before / tokens_after）此前虽在 004 里
+        声明过，却因 001 已建同名表而从未真正落库（详见 migrations/005 注释）。
+        此处使用关键字参数，兼容既有调用点。
+        """
         cur = self.conn.cursor()
         cur.execute(
-            "INSERT INTO context_compact_log(session_id, turn, ratio_before, ratio_after, actions_json, created_at) VALUES(?,?,?,?,?,?)",
-            (session_id, turn, ratio_before, ratio_after, json.dumps(actions, ensure_ascii=False), created_at or time.time()),
+            "INSERT INTO context_compact_log"
+            "(session_id, turn, trigger_level, ratio_before, ratio_after, tokens_before, tokens_after, actions_json, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                session_id,
+                turn,
+                trigger_level,
+                ratio_before,
+                ratio_after,
+                tokens_before,
+                tokens_after,
+                json.dumps(actions, ensure_ascii=False),
+                created_at or time.time(),
+            ),
         )
         self.conn.commit()
+
+    def recent_compacts(self, session_id: str, limit: int = 20) -> List[dict]:
+        """读取最近的压缩记录（doc/11 §8.1 可观测 / CLI `dla ctx compact`）。"""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT turn, trigger_level, ratio_before, ratio_after, tokens_before, tokens_after,"
+            " actions_json, created_at FROM context_compact_log"
+            " WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        )
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            try:
+                d["actions"] = json.loads(d.pop("actions_json") or "[]")
+            except (ValueError, TypeError):
+                d["actions"] = []
+            rows.append(d)
+        return rows
 
     # ---- kw_agent_map (doc/03 §2.15) ----
     def kwmap_upsert(self, src: str, dst: str, direction: str, delta_grad: float, learn_rate: float = 0.05) -> None:
@@ -183,6 +232,45 @@ class SQLiteRepo:
         ]
 
     # ---- 工具调用日志（doc/08 G6）----
+    # ---- 词库操作日志（doc/03 §2.12 / doc-06 §4.2/§4.4）----
+    def log_lexicon_op(
+        self,
+        session_id: str,
+        turn: int,
+        op_type: str,
+        layer: str,
+        target_key: Optional[str],
+        payload: Optional[str],
+        llm_reason: str = "",
+        applied: int = 0,
+        created_at: Optional[float] = None,
+    ) -> None:
+        """记录一次词库操作（scene_ops / agent_ops）。applied=0 表示被护栏拒绝。
+
+        ``payload`` 建议传原始 op 的 JSON，便于审计与回放。
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO lexicon_ops"
+            "(session_id, turn, op_type, layer, target_key, payload, llm_reason, applied, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                session_id, turn, op_type, layer, target_key, payload,
+                llm_reason, int(applied), created_at or time.time(),
+            ),
+        )
+        self.conn.commit()
+
+    def recent_lexicon_ops(self, session_id: str, limit: int = 50) -> List[dict]:
+        """读取最近的词库操作记录（doc-06 可观测 / 审计）。"""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT id, turn, op_type, layer, target_key, payload, llm_reason, applied, created_at"
+            " FROM lexicon_ops WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
     def log_tool_call(self, session_id: str, tool: str, args_json: str = "{}", ok: int = 1, error: str = "", created_at: Optional[float] = None) -> None:
         cur = self.conn.cursor()
         cur.execute(

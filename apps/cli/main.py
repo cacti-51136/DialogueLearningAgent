@@ -224,6 +224,11 @@ def cmd_ctx(args) -> int:
         n = cur.fetchone()[0]
         print(f"上下文压缩日志条数: {n}")
         print(f"compact_ratio 阈值: {settings.ctx_compact_ratio}  hard: {settings.ctx_hard_ratio}  auto: {settings.ctx_auto_compact}")
+        # 按档位汇总（doc/11 §8.1 可观测）
+        cur.execute("SELECT trigger_level, COUNT(*) FROM context_compact_log GROUP BY trigger_level ORDER BY 2 DESC")
+        by_level = cur.fetchall()
+        if by_level:
+            print("档位分布: " + "  ".join(f"{lv}={c}" for lv, c in by_level))
         return 0
     if args.sub == "compact":
         if getattr(args, "force", False):
@@ -240,14 +245,62 @@ def cmd_ctx(args) -> int:
                 print(f"已强制压缩：ratio {res['ratio_before']:.3f}→{res['ratio_after']:.3f}")
                 print(f"动作: {res['actions']}")
             return 0
-        cur.execute("SELECT turn, ratio_before, ratio_after, actions_json FROM context_compact_log ORDER BY turn DESC LIMIT 20")
+        cur.execute(
+            "SELECT turn, trigger_level, ratio_before, ratio_after, tokens_before, tokens_after, actions_json"
+            " FROM context_compact_log ORDER BY id DESC LIMIT 20"
+        )
         rows = cur.fetchall()
         if not rows:
             print("（暂无压缩记录）")
         for r in rows:
-            print(f"turn={r['turn']} ratio {r['ratio_before']:.3f}→{r['ratio_after']:.3f} actions={r['actions_json']}")
+            print(
+                f"turn={r['turn']} [{r['trigger_level']}] "
+                f"ratio {r['ratio_before']:.3f}→{r['ratio_after']:.3f} "
+                f"tokens {r['tokens_before']}→{r['tokens_after']} "
+                f"actions={r['actions_json']}"
+            )
         return 0
     print("未知 ctx 子命令"); return 2
+
+
+# ----------------------------- ops -----------------------------
+def cmd_ops(args) -> int:
+    """词库操作审计：列出 scene_ops / agent_ops 的即时增删改记录（doc/06 §4.2/§4.4）。
+
+    固定模式全程跳过运行期增删改；其余模式的操作（含被护栏拒绝的）均落 lexicon_ops。
+    """
+    settings = get_settings()
+    conn = get_connection(settings.db_path)
+    migrate(conn, "migrations")
+    cur = conn.cursor()
+    if args.sub == "list":
+        limit = int(getattr(args, "limit", 20) or 20)
+        sid = getattr(args, "session", None)
+        if sid:
+            cur.execute(
+                "SELECT turn, op_type, layer, target_key, applied, llm_reason"
+                " FROM lexicon_ops WHERE session_id=? ORDER BY id DESC LIMIT ?",
+                (sid, limit),
+            )
+        else:
+            cur.execute(
+                "SELECT session_id, turn, op_type, layer, target_key, applied"
+                " FROM lexicon_ops ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+        rows = cur.fetchall()
+        if not rows:
+            print("（暂无词库操作记录）")
+            return 0
+        for r in rows:
+            state = "生效" if r["applied"] else "拒绝"
+            if sid:
+                detail = f"  {r['llm_reason'] or ''}".rstrip()
+                print(f"turn={r['turn']:>3} [{r['op_type']:6}] {r['layer']} {r['target_key']} [{state}]{detail}")
+            else:
+                print(f"{r['session_id']} turn={r['turn']:>3} [{r['op_type']:6}] {r['layer']} {r['target_key']} [{state}]")
+        return 0
+    print("未知 ops 子命令"); return 2
 
 
 # ----------------------------- tool -----------------------------
@@ -379,6 +432,12 @@ def build_parser() -> argparse.ArgumentParser:
     pte = pts.add_parser("enable"); pte.add_argument("name")
     ptd2 = pts.add_parser("disable"); ptd2.add_argument("name")
 
+    po = sub.add_parser("ops", help="词库操作审计（scene_ops/agent_ops，doc/06 §4.2/§4.4）")
+    pos = po.add_subparsers(dest="sub")
+    pol = pos.add_parser("list")
+    pol.add_argument("--session", default=None, help="限定会话 id（缺省列出全部会话）")
+    pol.add_argument("--limit", type=int, default=20, help="最多展示条数")
+
     pb = sub.add_parser("bench", help="离线剧本回归")
     pb.add_argument("--no-db", action="store_true")
 
@@ -398,6 +457,8 @@ def main(argv: Optional[list] = None) -> int:
         return cmd_ctx(args)
     if args.cmd == "tool":
         return cmd_tool(args)
+    if args.cmd == "ops":
+        return cmd_ops(args)
     if args.cmd == "bench":
         return cmd_bench(args)
     parser.print_help()

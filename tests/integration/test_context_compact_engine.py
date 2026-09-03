@@ -107,7 +107,68 @@ def test_compact_log_persisted(tmp_path):
     rows = eng.repo.conn.execute(
         "SELECT COUNT(*) FROM context_compact_log WHERE session_id='S'"
     ).fetchone()[0]
-    assert rows >= 1, "压缩事件应写入 context_compact_log（迁移 004）"
+    assert rows >= 1, "压缩事件应写入 context_compact_log（迁移 005）"
+
+
+def test_compact_log_observability_fields_not_null(tmp_path):
+    """回归护栏（缺陷修复）：doc/11 §8.1 的三个可观测字段必须真正落库。
+
+    历史缺陷：004 用 CREATE TABLE IF NOT EXISTS 试图补列，但 001 已建同名表，
+    致其恒为 no-op —— trigger_level / tokens_before / tokens_after 从未存在。
+    现由 005 的重建表方式补齐，且 log_compact 必须写入非零的 token 真值。
+    """
+    eng = _make_engine(tmp_path)
+    eng.start_session(sid="OBS")
+    big = "我们练习了过去式的否定形式、疑问句转换以及连读发音要点"
+    sess = eng._sessions["OBS"]
+    sess.history_summaries = [f"第{i}轮：{big}" for i in range(60)]
+
+    eng._prepare_turn(sess, "继续练习", time.time())
+
+    row = eng.repo.conn.execute(
+        "SELECT trigger_level, tokens_before, tokens_after, ratio_before, ratio_after"
+        " FROM context_compact_log WHERE session_id='OBS' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None, "应写入压缩日志"
+
+    trigger_level, tokens_before, tokens_after, ratio_before, ratio_after = row
+
+    # 1) trigger_level 必须是真实档位，而非 NULL
+    assert trigger_level in ("WARN", "COMPACT", "HARD"), (
+        f"trigger_level 应为真实档位，实际 {trigger_level!r}"
+    )
+    # 本用例 60 条长摘要必然过 COMPACT(0.85)
+    assert trigger_level in ("COMPACT", "HARD")
+
+    # 2) token 真值必须被写入（旧逻辑恒为 NULL/缺失）
+    assert tokens_before > 0, f"tokens_before 应为正真值，实际 {tokens_before}"
+    assert tokens_after > 0, f"tokens_after 应为正真值，实际 {tokens_after}"
+    assert tokens_after <= tokens_before, (
+        f"压缩后 token 数不应增加：{tokens_before} → {tokens_after}"
+    )
+
+    # 3) 与 ratio 口径自洽：tokens 比值 ≈ ratio 比值（同一 denominator）
+    if tokens_before > 0 and ratio_before > 0:
+        assert abs((tokens_after / tokens_before) - (ratio_after / ratio_before)) < 0.05
+
+
+def test_compact_log_manual_trigger_level(tmp_path):
+    """CLI `--force` 手动压缩的 trigger_level 必须标记为 MANUAL（区别于自动档位）。"""
+    eng = _make_engine(tmp_path)
+    eng.start_session(sid="MAN")
+    big = "我们练习了过去式的否定形式、疑问句转换以及连读发音要点"
+    eng._sessions["MAN"].history_summaries = [f"第{i}轮：{big}" for i in range(60)]
+
+    res = eng.force_compact("MAN")
+    assert res["triggered"] is True
+
+    row = eng.repo.conn.execute(
+        "SELECT trigger_level, tokens_before, tokens_after"
+        " FROM context_compact_log WHERE session_id='MAN' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "MANUAL", f"手动压缩应标记 MANUAL，实际 {row[0]!r}"
+    assert row[1] > 0 and row[2] > 0, "手动压缩也应记录 token 真值"
 
 
 def test_no_compact_when_under_threshold(tmp_path):

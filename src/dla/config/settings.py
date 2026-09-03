@@ -109,6 +109,7 @@ class Settings:
     mode_auto_warmup_turns: int = 3
     mode_free_bootstrap_conf: float = 0.6
     mode_free_require_desc: bool = True
+    mode_free_bootstrap_model: str = ""  # 留空复用 analyzer_model（可用更便宜模型做 Bootstrap）
 
     # ---- 对话历史冷热记忆（doc/07）----
     memory_enable: bool = True
@@ -193,6 +194,11 @@ class Settings:
         return self.llm_analyzer_model or self.llm_model
 
     @property
+    def bootstrap_model(self) -> str:
+        """Bootstrap 专用模型（doc/01 §D26）：留空复用分析器模型。"""
+        return self.mode_free_bootstrap_model or self.analyzer_model
+
+    @property
     def greeting_fallback_list(self) -> list[str]:
         return _as_list(self.greeting_fallback_pool, ",")
 
@@ -273,6 +279,7 @@ class Settings:
             mode_auto_warmup_turns=env("DLA_MODE__AUTO_WARMUP_TURNS", 3, int),
             mode_free_bootstrap_conf=env("DLA_MODE__FREE_BOOTSTRAP_CONF", 0.6, float),
             mode_free_require_desc=env("DLA_MODE__FREE_REQUIRE_DESC", True, _as_bool),
+            mode_free_bootstrap_model=env("DLA_MODE__FREE_BOOTSTRAP_MODEL", ""),
             memory_enable=env("DLA_MEMORY__ENABLE", True, _as_bool),
             memory_hot_window=env("DLA_MEMORY__HOT_WINDOW", 6, int),
             memory_cold_top_k=env("DLA_MEMORY__COLD_TOP_K", 4, int),
